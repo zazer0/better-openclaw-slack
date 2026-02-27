@@ -1,0 +1,40 @@
+{
+  "id": "better-openclaw-slack",
+  "name": "Slack Bridge",
+  "description": "Bridges Slack threads to OpenClaw sessions via Bolt.js Socket Mode and the gateway /v1/chat/completions API.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "channelId": {
+        "type": "string",
+        "default": "C12345678",
+        "description": "Slack channel ID to listen in"
+      },
+      "gatewayUrl": {
+        "type": "string",
+        "default": "http://127.0.0.1:18789",
+        "description": "OpenClaw gateway URL"
+      },
+      "agentId": {
+        "type": "string",
+        "default": "main",
+        "description": "OpenClaw agent ID for sessions"
+      },
+      "maxMessageLength": {
+        "type": "integer",
+        "minimum": 500,
+        "maximum": 40000,
+        "default": 4000,
+        "description": "Max Slack message length before splitting"
+      }
+    }
+  },
+  "uiHints": {
+    "channelId": { "label": "Slack Channel ID", "placeholder": "C12345678" },
+    "gatewayUrl": { "label": "Gateway URL", "placeholder": "http://127.0.0.1:18789" },
+    "agentId": { "label": "Agent ID", "placeholder": "main" },
+    "maxMessageLength": { "label": "Max Message Length", "advanced": true }
+  }
+}
+

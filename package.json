@@ -1,0 +1,11 @@
+{
+  "name": "better-openclaw-slack",
+  "version": "1.0.0",
+  "description": "OpenClaw extension that bridges Slack threads to OpenClaw sessions",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@slack/bolt": "^4.2.1"
+  }
+}
