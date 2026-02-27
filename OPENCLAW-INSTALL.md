@@ -31,15 +31,46 @@ After adding or changing any scopes, **reinstall the app to your workspace** to 
    - `SLACK_APP_TOKEN`
    - `SLACK_CHANNEL_ID`
    - `OPENCLAW_GATEWAY_TOKEN` (if their gateway requires one; otherwise leave empty)
-2. `cd ~/.openclaw/extensions`
-3. `git clone https://github.com/zazer0/better-openclaw-slack`
-4. `cd ~/.openclaw/extensions/better-openclaw-slack`
-5. `npm install`
-6. Create `.env` exactly as below in the extension directory:
+2. **VALIDATE SCOPES BEFORE PROCEEDING** (see section below). Do NOT continue with the install until all required scopes pass.
+3. `cd ~/.openclaw/extensions`
+4. `git clone https://github.com/zazer0/better-openclaw-slack`
+5. `cd ~/.openclaw/extensions/better-openclaw-slack`
+6. `npm install`
+7. Create `.env` exactly as below in the extension directory:
    - `~/.openclaw/extensions/better-openclaw-slack/.env`
-7. Add the plugin entry to `openclaw.json` using the exact JSON block below.
-8. Restart the gateway with this exact command:
+8. Add the plugin entry to `openclaw.json` using the exact JSON block below.
+9. Restart the gateway with this exact command:
    `systemctl --user restart openclaw-gateway || openclaw gateway restart`
+
+## 🔍 Validate Scopes (MANDATORY — run before install)
+
+After the human provides `SLACK_BOT_TOKEN`, you **must** validate that the token has all required scopes before touching any config or installing anything. This prevents a broken gateway config from a misconfigured Slack app.
+
+Run this command (replacing `$SLACK_BOT_TOKEN` with the actual token):
+
+```bash
+curl -sI -H "Authorization: Bearer $SLACK_BOT_TOKEN" https://slack.com/api/auth.test | grep -i x-oauth-scopes
+```
+
+The `x-oauth-scopes` response header lists all scopes granted to the token as a comma-separated string.
+
+**Check that ALL of these scopes are present in the header value:**
+- `app_mentions:read`
+- `channels:history`
+- `groups:history`
+- `chat:write`
+- `reactions:read`
+- `reactions:write`
+
+**If any scope is missing:**
+1. Tell the human exactly which scopes are missing.
+2. Direct them to their Slack App settings → **OAuth & Permissions** → **Bot Token Scopes** to add them.
+3. Remind them to **reinstall the app to their workspace** after adding scopes (scopes don't take effect until reinstalled).
+4. After they confirm, re-run the validation. Do NOT proceed until all 6 scopes are confirmed present.
+
+**If the `curl` call fails or returns no header:** the token is likely invalid. Ask the human to double-check the bot token value.
+
+---
 
 ## Exact `.env` file
 Create exactly this file at:
