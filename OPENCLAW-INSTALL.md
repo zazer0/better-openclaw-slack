@@ -23,6 +23,21 @@ Also required under **App-Level Tokens** (for Socket Mode):
 
 After adding or changing any scopes, **reinstall the app to your workspace** to apply them.
 
+
+## ⚠️ Required Event Subscriptions
+
+Go to [api.slack.com/apps](http://api.slack.com/apps) → your app → **Event Subscriptions**:
+
+1. Turn **"Enable Events"** to **On**
+2. Under **"Subscribe to bot events"**, add:
+   - `message.channels` — messages in public channels
+   - `message.groups` — messages in private channels (if needed)
+   - `app_mention` — when someone @mentions the bot
+3. **Save Changes**
+4. Slack may ask you to **reinstall the app** — do it
+
+Without these event subscriptions, the bot will not receive any messages from Slack.
+
 ---
 
 ## Steps
