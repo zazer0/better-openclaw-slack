@@ -1,5 +1,30 @@
 # OpenClaw Agent Install Instructions
 
+## ⚠️ Required Slack App Scopes
+
+Before installing, the Slack App **must** have all of the following bot token scopes enabled. **Missing any of these will cause the plugin to fail.**
+
+Go to your Slack App → **OAuth & Permissions** → **Bot Token Scopes** and verify each is present:
+
+| Scope | Purpose |
+|---|---|
+| `app_mentions:read` | View messages that mention the bot |
+| `channels:history` | View messages in public channels |
+| `groups:history` | View messages in private channels |
+| `chat:write` | Send messages |
+| `reactions:read` | View reactions on messages |
+| `reactions:write` | Add/remove reactions |
+
+Also required under **App-Level Tokens** (for Socket Mode):
+
+| Scope | Purpose |
+|---|---|
+| `connections:write` | Required for Socket Mode |
+
+After adding or changing any scopes, **reinstall the app to your workspace** to apply them.
+
+---
+
 ## Steps
 1. ASK THE HUMAN for values:
    - `SLACK_BOT_TOKEN`
