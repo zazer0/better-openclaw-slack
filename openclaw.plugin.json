@@ -27,6 +27,20 @@
         "maximum": 40000,
         "default": 4000,
         "description": "Max Slack message length before splitting"
+      },
+      "updateIntervalMs": {
+        "type": "integer",
+        "minimum": 500,
+        "maximum": 10000,
+        "default": 1500,
+        "description": "How often (ms) to update the Slack placeholder while streaming"
+      },
+      "inactivityTimeoutMs": {
+        "type": "integer",
+        "minimum": 5000,
+        "maximum": 300000,
+        "default": 30000,
+        "description": "Abort stream after this many ms of silence from the gateway"
       }
     }
   },
@@ -34,7 +48,9 @@
     "channelId": { "label": "Slack Channel ID", "placeholder": "C12345678" },
     "gatewayUrl": { "label": "Gateway URL", "placeholder": "http://127.0.0.1:18789" },
     "agentId": { "label": "Agent ID", "placeholder": "main" },
-    "maxMessageLength": { "label": "Max Message Length", "advanced": true }
+    "maxMessageLength": { "label": "Max Message Length", "advanced": true },
+    "updateIntervalMs": { "label": "Stream Update Interval (ms)", "advanced": true },
+    "inactivityTimeoutMs": { "label": "Inactivity Timeout (ms)", "advanced": true }
   }
 }
 

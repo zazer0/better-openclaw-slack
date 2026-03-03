@@ -5,6 +5,8 @@ type PluginConfig = {
   gatewayUrl?: string;
   agentId?: string;
   maxMessageLength?: number;
+  updateIntervalMs?: number;
+  inactivityTimeoutMs?: number;
 };
 
 function parseChannelId(value: unknown): string | undefined {
@@ -27,6 +29,18 @@ function parseMaxMessageLength(value: unknown): number {
   const candidate = Number(value);
   if (Number.isFinite(candidate) && candidate > 0) return candidate;
   return 4000;
+}
+
+function parseUpdateIntervalMs(value: unknown): number {
+  const candidate = Number(value);
+  if (Number.isFinite(candidate) && candidate >= 500 && candidate <= 10000) return candidate;
+  return 1500;
+}
+
+function parseInactivityTimeoutMs(value: unknown): number {
+  const candidate = Number(value);
+  if (Number.isFinite(candidate) && candidate >= 5000 && candidate <= 300000) return candidate;
+  return 30000;
 }
 
 function resolveThreadTs(message: { thread_ts?: string; ts: string }): string {
@@ -81,13 +95,101 @@ function parseGatewayError(status: number, payloadText: string): string {
   return `⚠️ Gateway error (${status})`;
 }
 
-async function queryOpenClaw(options: {
+function makeError(
+  code: string,
+  message: string,
+  extra?: Record<string, unknown>,
+): Error & { code: string } {
+  return Object.assign(new Error(message), { code, ...extra });
+}
+
+async function readWithInactivityTimeout<T>(
+  reader: ReadableStreamDefaultReader<T>,
+  timeoutMs: number,
+  ac: AbortController,
+): Promise<ReadableStreamReadResult<T>> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      ac.abort();
+      reject(makeError("GATEWAY_TIMEOUT", "⚠️ Gateway timed out — try again"));
+    }, timeoutMs);
+
+    reader.read().then(
+      (result) => {
+        clearTimeout(timer);
+        resolve(result);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
+
+function throttledSlackUpdater(options: {
+  client: any;
+  channel: string;
+  placeholderTs: string;
+  updateIntervalMs: number;
+  logger: { warn?: (message: string, ...args: unknown[]) => void };
+}): {
+  onDelta: (accumulated: string) => void;
+  stop: () => void;
+} {
+  let pendingText = "";
+  let lastPosted = "";
+  let currentIntervalMs = options.updateIntervalMs;
+  let intervalId: ReturnType<typeof setInterval>;
+
+  function scheduleInterval(): void {
+    intervalId = setInterval(async () => {
+      const current = pendingText;
+      if (current === lastPosted) return;
+      try {
+        await options.client.chat.update({
+          channel: options.channel,
+          ts: options.placeholderTs,
+          text: current,
+        });
+        lastPosted = current;
+      } catch (err: any) {
+        if (err?.data?.error === "ratelimited" || err?.code === "slack_webapi_rate_limited_error") {
+          options.logger.warn?.("chat.update rate limited, backing off");
+          clearInterval(intervalId);
+          currentIntervalMs = Math.min(currentIntervalMs * 2, 10000);
+          scheduleInterval();
+        } else {
+          options.logger.warn?.(
+            "chat.update failed, skipping window",
+            err?.message || String(err),
+          );
+        }
+      }
+    }, currentIntervalMs);
+  }
+
+  scheduleInterval();
+
+  return {
+    onDelta(accumulated: string): void {
+      pendingText = accumulated;
+    },
+    stop(): void {
+      clearInterval(intervalId);
+    },
+  };
+}
+
+async function* queryOpenClaw(options: {
   sessionKey: string;
   userText: string;
   gatewayUrl: string;
   gatewayToken: string | undefined;
   agentId: string;
-}): Promise<string> {
+  inactivityTimeoutMs: number;
+}): AsyncGenerator<string, void, unknown> {
+  const ac = new AbortController();
   const endpoint = `${options.gatewayUrl.replace(/\/$/, "")}/v1/chat/completions`;
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -103,7 +205,7 @@ async function queryOpenClaw(options: {
     model: "openclaw",
     messages: [{ role: "user", content: options.userText }],
     user: options.sessionKey,
-    stream: false,
+    stream: true,
   };
 
   let response: Response;
@@ -112,44 +214,77 @@ async function queryOpenClaw(options: {
       method: "POST",
       headers,
       body: JSON.stringify(body),
+      signal: ac.signal,
     });
   } catch (error) {
-    const gatewayUnavailableError = new Error("Gateway unavailable") as Error & {
-      code: string;
-      cause?: unknown;
-    };
-    gatewayUnavailableError.code = "GATEWAY_UNAVAILABLE";
-    gatewayUnavailableError.cause = error;
-    throw gatewayUnavailableError;
+    throw makeError("GATEWAY_UNAVAILABLE", "Gateway unavailable", { cause: error });
   }
 
-  const responseText = await response.text();
   if (!response.ok) {
-    const gatewayHttpError = new Error(
-      parseGatewayError(response.status, responseText),
-    ) as Error & { code: string; status?: number };
-    gatewayHttpError.code = "GATEWAY_ERROR";
-    gatewayHttpError.status = response.status;
-    throw gatewayHttpError;
+    const responseText = await response.text();
+    throw makeError("GATEWAY_ERROR", parseGatewayError(response.status, responseText), {
+      status: response.status,
+    });
   }
 
-  let parsed: any;
+  const contentType = response.headers.get("content-type") ?? "";
+  if (!contentType.startsWith("text/event-stream")) {
+    // Graceful fallback: gateway ignored stream: true, returned non-SSE response.
+    try {
+      const responseText = await response.text();
+      const parsed = JSON.parse(responseText);
+      const content = parsed?.choices?.[0]?.message?.content;
+      if (typeof content === "string" && content.trim()) {
+        console.warn(
+          "better-openclaw-slack: gateway returned non-SSE response, falling back to non-streaming parse",
+        );
+        yield content;
+        return;
+      }
+    } catch {
+      // fall through to throw GATEWAY_STREAM_ERROR
+    }
+    throw makeError("GATEWAY_STREAM_ERROR", "⚠️ Gateway stream error");
+  }
+
+  const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
+  let hasContent = false;
+  let lineBuffer = "";
+
   try {
-    parsed = JSON.parse(responseText);
-  } catch (error) {
-    const invalidPayloadError = new Error("⚠️ Gateway returned an invalid response");
-    invalidPayloadError.code = "GATEWAY_ERROR" as const;
-    throw invalidPayloadError;
-  }
+    while (true) {
+      const chunk = await readWithInactivityTimeout(reader, options.inactivityTimeoutMs, ac);
 
-  const reply = parsed?.choices?.[0]?.message?.content;
-  if (typeof reply !== "string" || !reply.trim()) {
-    const emptyReplyError = new Error("⚠️ Gateway returned an empty reply");
-    emptyReplyError.code = "GATEWAY_ERROR";
-    throw emptyReplyError;
-  }
+      if (chunk.done) {
+        if (hasContent) return;
+        throw makeError("GATEWAY_EMPTY_STREAM", "⚠️ Gateway returned an empty reply");
+      }
 
-  return reply;
+      lineBuffer += decoder.decode(chunk.value, { stream: true });
+      const lines = lineBuffer.split("\n");
+      lineBuffer = lines.pop()!;
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("data:")) continue;
+        const dataStr = trimmed.slice("data:".length).trim();
+        if (dataStr === "[DONE]") return;
+        try {
+          const parsed = JSON.parse(dataStr);
+          const delta = parsed?.choices?.[0]?.delta?.content;
+          if (typeof delta === "string" && delta.length > 0) {
+            hasContent = true;
+            yield delta;
+          }
+        } catch {
+          // Skip malformed SSE data lines.
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 async function safeAddEyesReaction(
@@ -224,6 +359,8 @@ export default {
         const gatewayUrl = parseGatewayUrl(cfg.gatewayUrl);
         const agentId = parseAgentId(cfg.agentId);
         const maxMessageLength = parseMaxMessageLength(cfg.maxMessageLength);
+        const updateIntervalMs = parseUpdateIntervalMs(cfg.updateIntervalMs);
+        const inactivityTimeoutMs = parseInactivityTimeoutMs(cfg.inactivityTimeoutMs);
 
         let SlackApp;
         let LogLevel;
@@ -269,37 +406,138 @@ export default {
             logger.error("Unable to add eyes reaction", error as any);
           }
 
+          // Post placeholder; if this fails, abort without starting gateway fetch.
+          let placeholderTs: string;
           try {
-            const reply = await queryOpenClaw({
+            const placeholderResult = await client.chat.postMessage({
+              channel: message.channel,
+              thread_ts: threadTs,
+              text: "_⏳ Working..._",
+            });
+            placeholderTs = placeholderResult.ts;
+          } catch (placeholderError) {
+            logger.error("Failed to post placeholder message", placeholderError as any);
+            try {
+              await client.chat.postMessage({
+                channel: message.channel,
+                thread_ts: threadTs,
+                text: "⚠️ Failed to post message to Slack",
+              });
+            } catch {
+              // ignore
+            }
+            await safeRemoveEyesReaction(client, message.channel, message.ts, logger);
+            return;
+          }
+
+          let accumulated = "";
+          const updater = throttledSlackUpdater({
+            client,
+            channel: message.channel,
+            placeholderTs,
+            updateIntervalMs,
+            logger,
+          });
+
+          try {
+            for await (const delta of queryOpenClaw({
               sessionKey,
               userText: message.text,
               gatewayUrl,
               gatewayToken,
               agentId,
-            });
+              inactivityTimeoutMs,
+            })) {
+              accumulated += delta;
+              updater.onDelta(accumulated);
+            }
 
-            const chunks = splitMessage(reply, maxMessageLength);
-            for (const chunk of chunks) {
+            updater.stop();
+
+            // Final update: replace placeholder with first chunk, post overflow as new messages.
+            const finalText = accumulated || "⚠️ Gateway returned an empty reply";
+            const chunks = splitMessage(finalText, maxMessageLength);
+
+            try {
+              await client.chat.update({
+                channel: message.channel,
+                ts: placeholderTs,
+                text: chunks[0],
+              });
+            } catch (err: any) {
+              if (
+                err?.data?.error === "ratelimited" ||
+                err?.code === "slack_webapi_rate_limited_error"
+              ) {
+                logger.warn?.("Final chat.update rate limited, retrying after 2s");
+                await new Promise<void>((resolve) => setTimeout(resolve, 2000));
+                try {
+                  await client.chat.update({
+                    channel: message.channel,
+                    ts: placeholderTs,
+                    text: chunks[0],
+                  });
+                } catch {
+                  await client.chat.postMessage({
+                    channel: message.channel,
+                    thread_ts: threadTs,
+                    text: chunks[0],
+                  });
+                }
+              } else {
+                throw err;
+              }
+            }
+
+            for (let i = 1; i < chunks.length; i++) {
               await client.chat.postMessage({
                 channel: message.channel,
                 thread_ts: threadTs,
-                text: chunk,
+                text: chunks[i],
               });
             }
           } catch (error) {
+            updater.stop();
             logger.error("Message handling failed", error as any);
 
-            const errorText =
-              (error as any)?.code === "GATEWAY_UNAVAILABLE"
-                ? "⚠️ Gateway unavailable, try again later"
-                : (error as any)?.message || "⚠️ Unexpected error";
+            const code = (error as any)?.code;
+            let errorText: string;
+            switch (code) {
+              case "GATEWAY_UNAVAILABLE":
+                errorText = "⚠️ Gateway unavailable, try again later";
+                break;
+              case "GATEWAY_ERROR":
+                errorText = (error as any)?.message || "⚠️ Gateway error";
+                break;
+              case "GATEWAY_STREAM_ERROR":
+                errorText = accumulated
+                  ? `${accumulated}\n\n⚠️ Stream interrupted`
+                  : "⚠️ Gateway stream error";
+                break;
+              case "GATEWAY_TIMEOUT":
+                errorText = "⚠️ Gateway timed out — try again";
+                break;
+              case "GATEWAY_EMPTY_STREAM":
+                errorText = "⚠️ Gateway returned an empty reply";
+                break;
+              default:
+                errorText = (error as any)?.message || "⚠️ Unexpected error";
+            }
 
             try {
-              await client.chat.postMessage({
+              const errorChunks = splitMessage(errorText, maxMessageLength);
+              await client.chat.update({
                 channel: message.channel,
-                thread_ts: threadTs,
-                text: errorText,
+                ts: placeholderTs,
+                text: errorChunks[0],
               });
+              for (let i = 1; i < errorChunks.length; i++) {
+                await client.chat.postMessage({
+                  channel: message.channel,
+                  thread_ts: threadTs,
+                  text: errorChunks[i],
+                });
+              }
             } catch (postError) {
               logger.error("Failed to post error message to Slack", postError as any);
             }
@@ -355,4 +593,3 @@ export default {
     });
   },
 };
-
