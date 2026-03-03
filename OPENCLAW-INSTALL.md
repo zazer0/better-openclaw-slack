@@ -53,8 +53,9 @@ Without these event subscriptions, the bot will not receive any messages from Sl
 6. `npm install`
 7. Create `.env` exactly as below in the extension directory:
    - `~/.openclaw/extensions/better-openclaw-slack/.env`
-8. Add the plugin entry to `openclaw.json` using the exact JSON block below.
-9. Restart the gateway with this exact command:
+8. Enable the gateway chat completions endpoint (see "Enable Gateway Chat Completions Endpoint" section below).
+9. Add the plugin entry to `openclaw.json` using the exact JSON block below.
+10. Restart the gateway with this exact command:
    `systemctl --user restart openclaw-gateway || openclaw gateway restart`
 
 ## 🔍 Validate Scopes (MANDATORY — run before install)
@@ -131,8 +132,51 @@ Defaults (can be omitted if acceptable):
 - `agentId`: `main`
 - `maxMessageLength`: `4000`
 
+## Enable Gateway Chat Completions Endpoint
+
+The plugin communicates with the gateway via the OpenAI-compatible chat completions endpoint. This **must** be enabled.
+
+Merge this into the `gateway` section of `openclaw.json`:
+
+```json
+{
+  "gateway": {
+    "http": {
+      "endpoints": {
+        "chatCompletions": {
+          "enabled": true
+        }
+      }
+    }
+  }
+}
+```
+
+If `gateway` or `gateway.http` already exists in your config, just add the `endpoints` block — do not overwrite existing settings.
+
+---
+
 ## Gateway restart command
 
 ```bash
 systemctl --user restart openclaw-gateway || openclaw gateway restart
 ```
+
+---
+
+## Updating
+
+If you already have the plugin installed and want to pull the latest version:
+
+```bash
+# 1. Pull latest from GitHub
+cd ~/.openclaw/extensions/better-openclaw-slack && git pull origin main
+
+# 2. Copy the runnable JS into place (required — OC loads index.js, not src/index.js)
+cp src/index.js index.js
+
+# 3. Restart the gateway
+systemctl --user restart openclaw-gateway || openclaw gateway restart
+```
+
+**Why step 2?** The repo's canonical source is `index.ts` (TypeScript) with a CJS mirror at `src/index.js`. OC loads `index.js` from the top-level directory. There is no build step — deploying means copying `src/index.js` to `index.js`. If you skip this, the old version keeps running even after a pull.
