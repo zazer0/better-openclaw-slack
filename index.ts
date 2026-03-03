@@ -9,6 +9,9 @@ type PluginConfig = {
   inactivityTimeoutMs?: number;
 };
 
+type TimerResetRef = { reset: (() => void) | null };
+type RunIdRef = { value: string | null };
+
 function parseChannelId(value: unknown): string | undefined {
   return typeof value === "string" && value.trim().length > 0
     ? value.trim()
@@ -40,7 +43,7 @@ function parseUpdateIntervalMs(value: unknown): number {
 function parseInactivityTimeoutMs(value: unknown): number {
   const candidate = Number(value);
   if (Number.isFinite(candidate) && candidate >= 5000 && candidate <= 300000) return candidate;
-  return 30000;
+  return 60000;
 }
 
 function resolveThreadTs(message: { thread_ts?: string; ts: string }): string {
@@ -107,12 +110,25 @@ async function readWithInactivityTimeout<T>(
   reader: ReadableStreamDefaultReader<T>,
   timeoutMs: number,
   ac: AbortController,
+  provideReset?: (reset: () => void) => void,
 ): Promise<ReadableStreamReadResult<T>> {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      ac.abort();
-      reject(makeError("GATEWAY_TIMEOUT", "⚠️ Gateway timed out — try again"));
-    }, timeoutMs);
+    let timer: ReturnType<typeof setTimeout>;
+
+    const arm = () => {
+      timer = setTimeout(() => {
+        ac.abort();
+        reject(makeError("GATEWAY_TIMEOUT", "⚠️ Gateway timed out — try again"));
+      }, timeoutMs);
+    };
+
+    const reset = () => {
+      clearTimeout(timer);
+      arm();
+    };
+
+    provideReset?.(reset);
+    arm();
 
     reader.read().then(
       (result) => {
@@ -135,10 +151,12 @@ function throttledSlackUpdater(options: {
   logger: { warn?: (message: string, ...args: unknown[]) => void };
 }): {
   onDelta: (accumulated: string) => void;
+  setWorkingText: (text: string) => void;
   stop: () => void;
 } {
   let pendingText = "";
   let lastPosted = "";
+  let contentReceived = false;
   let currentIntervalMs = options.updateIntervalMs;
   let intervalId: ReturnType<typeof setInterval>;
 
@@ -173,7 +191,13 @@ function throttledSlackUpdater(options: {
 
   return {
     onDelta(accumulated: string): void {
+      contentReceived = true;
       pendingText = accumulated;
+    },
+    setWorkingText(text: string): void {
+      if (!contentReceived) {
+        pendingText = text;
+      }
     },
     stop(): void {
       clearInterval(intervalId);
@@ -188,6 +212,8 @@ async function* queryOpenClaw(options: {
   gatewayToken: string | undefined;
   agentId: string;
   inactivityTimeoutMs: number;
+  timerResetRef?: TimerResetRef;
+  runIdRef?: RunIdRef;
 }): AsyncGenerator<string, void, unknown> {
   const ac = new AbortController();
   const endpoint = `${options.gatewayUrl.replace(/\/$/, "")}/v1/chat/completions`;
@@ -254,7 +280,16 @@ async function* queryOpenClaw(options: {
 
   try {
     while (true) {
-      const chunk = await readWithInactivityTimeout(reader, options.inactivityTimeoutMs, ac);
+      const chunk = await readWithInactivityTimeout(
+        reader,
+        options.inactivityTimeoutMs,
+        ac,
+        options.timerResetRef
+          ? (reset) => {
+              options.timerResetRef!.reset = reset;
+            }
+          : undefined,
+      );
 
       if (chunk.done) {
         if (hasContent) return;
@@ -272,6 +307,12 @@ async function* queryOpenClaw(options: {
         if (dataStr === "[DONE]") return;
         try {
           const parsed = JSON.parse(dataStr);
+
+          // Extract runId from first SSE event that carries an id.
+          if (options.runIdRef && options.runIdRef.value === null && parsed.id) {
+            options.runIdRef.value = String(parsed.id);
+          }
+
           const delta = parsed?.choices?.[0]?.delta?.content;
           if (typeof delta === "string" && delta.length > 0) {
             hasContent = true;
@@ -285,6 +326,142 @@ async function* queryOpenClaw(options: {
   } finally {
     reader.releaseLock();
   }
+}
+
+// Opens a parallel WebSocket to the gateway to receive tool events for the current run.
+// Calls onToolStart when a tool.start event arrives (filtered by runId).
+// Resets the inactivity timer on every tool event.
+// Returns a cleanup handle. Rejects if the WS cannot connect/authenticate.
+async function openToolWatcher(options: {
+  gatewayUrl: string;
+  gatewayToken: string | undefined;
+  runIdRef: RunIdRef;
+  timerResetRef: TimerResetRef;
+  onToolStart: (toolName: string) => void;
+  logger: { warn?: (message: string, ...args: unknown[]) => void };
+}): Promise<{ close: () => void }> {
+  const wsUrl = options.gatewayUrl
+    .replace(/^https:\/\//i, "wss://")
+    .replace(/^http:\/\//i, "ws://")
+    .replace(/\/+$/, "");
+
+  // Dynamic import to avoid top-level dependency issues.
+  const wsModule: any = await import("ws");
+  const WebSocketCtor = wsModule.default ?? wsModule.WebSocket ?? wsModule;
+
+  return new Promise((resolve, reject) => {
+    let connected = false;
+    let ws: any;
+
+    try {
+      ws = new WebSocketCtor(wsUrl, { maxPayload: 25 * 1024 * 1024 });
+    } catch (err) {
+      reject(err);
+      return;
+    }
+
+    const connectTimeout = setTimeout(() => {
+      try {
+        ws.terminate();
+      } catch {}
+      reject(new Error("WS connect timeout"));
+    }, 8000);
+
+    const closeWs = () => {
+      clearTimeout(connectTimeout);
+      try {
+        ws.close();
+      } catch {}
+    };
+
+    ws.on("error", (err: Error) => {
+      if (!connected) {
+        clearTimeout(connectTimeout);
+        reject(err);
+      }
+      // After connection: ignore errors, WS will close.
+    });
+
+    ws.on("close", () => {
+      clearTimeout(connectTimeout);
+      if (!connected) {
+        reject(new Error("WS closed before auth"));
+      }
+    });
+
+    ws.on("message", (data: any) => {
+      let msg: any;
+      try {
+        const raw = typeof data === "string" ? data : data.toString("utf8");
+        msg = JSON.parse(raw);
+      } catch {
+        return;
+      }
+
+      if (!connected) {
+        // Handshake: wait for connect.challenge, then send connect request.
+        if (msg.type === "event" && msg.event === "connect.challenge") {
+          const connectParams: Record<string, unknown> = {
+            minProtocol: 3,
+            maxProtocol: 3,
+            client: {
+              id: "gateway-client",
+              displayName: "slack-bridge",
+              version: "dev",
+              platform: process.platform,
+              mode: "backend",
+            },
+            caps: ["tool-events"],
+            role: "operator",
+            scopes: ["operator.admin"],
+          };
+          if (options.gatewayToken) {
+            connectParams.auth = { token: options.gatewayToken };
+          }
+          try {
+            ws.send(
+              JSON.stringify({ type: "req", id: "c1", method: "connect", params: connectParams }),
+            );
+          } catch {}
+          return;
+        }
+
+        if (msg.type === "res" && msg.id === "c1") {
+          clearTimeout(connectTimeout);
+          if (msg.ok) {
+            connected = true;
+            resolve({ close: closeWs });
+          } else {
+            reject(
+              new Error(`WS auth failed: ${msg.error?.message ?? "unknown"}`),
+            );
+            try {
+              ws.close();
+            } catch {}
+          }
+          return;
+        }
+        return;
+      }
+
+      // Connected: handle agent events.
+      if (msg.type !== "event" || msg.event !== "agent") return;
+      const payload = msg.payload;
+      if (!payload || typeof payload !== "object") return;
+      if (payload.stream !== "tool") return;
+      // Filter by runId once it becomes known from the SSE stream.
+      if (options.runIdRef.value !== null && payload.runId !== options.runIdRef.value) return;
+
+      // Reset inactivity timer on every tool event.
+      options.timerResetRef.reset?.();
+
+      const phase = payload.data?.phase;
+      const toolName = payload.data?.name;
+      if (phase === "start" && typeof toolName === "string" && toolName.trim()) {
+        options.onToolStart(toolName.trim());
+      }
+    });
+  });
 }
 
 async function safeAddEyesReaction(
@@ -430,6 +607,11 @@ export default {
             return;
           }
 
+          const timerResetRef: TimerResetRef = { reset: null };
+          const runIdRef: RunIdRef = { value: null };
+          const toolNames: string[] = [];
+          let toolWatcher: { close: () => void } | null = null;
+
           let accumulated = "";
           const updater = throttledSlackUpdater({
             client,
@@ -439,6 +621,27 @@ export default {
             logger,
           });
 
+          // Start WS tool watcher in background; gracefully degrade if it fails.
+          openToolWatcher({
+            gatewayUrl,
+            gatewayToken,
+            runIdRef,
+            timerResetRef,
+            onToolStart: (toolName) => {
+              if (!toolNames.includes(toolName)) {
+                toolNames.push(toolName);
+              }
+              updater.setWorkingText(`_🔧 Working... (${toolNames.join(", ")})_`);
+            },
+            logger,
+          })
+            .then((watcher) => {
+              toolWatcher = watcher;
+            })
+            .catch(() => {
+              logger.warn?.("tool-watcher: WS unavailable, tool visibility disabled");
+            });
+
           try {
             for await (const delta of queryOpenClaw({
               sessionKey,
@@ -447,6 +650,8 @@ export default {
               gatewayToken,
               agentId,
               inactivityTimeoutMs,
+              timerResetRef,
+              runIdRef,
             })) {
               accumulated += delta;
               updater.onDelta(accumulated);
@@ -542,6 +747,7 @@ export default {
               logger.error("Failed to post error message to Slack", postError as any);
             }
           } finally {
+            toolWatcher?.close();
             await safeRemoveEyesReaction(client, message.channel, message.ts, logger);
           }
         });
