@@ -414,9 +414,15 @@ module.exports = {
             await client.reactions.add({ channel, timestamp, name: 'eyes' });
           } catch (error) {
             const errorCode = error?.data?.error;
-            if (errorCode !== 'already_reacted' && errorCode !== 'invalid_name') {
-              throw error;
+            if (errorCode === 'already_reacted' || errorCode === 'invalid_name') {
+              return;
             }
+            if (errorCode === 'ratelimited' || error?.code === 'slack_webapi_rate_limited_error') {
+              await new Promise((resolve) => setTimeout(resolve, 2000));
+              await client.reactions.add({ channel, timestamp, name: 'eyes' });
+              return;
+            }
+            throw error;
           }
         }
 
@@ -438,24 +444,15 @@ module.exports = {
           logLevel: LogLevel.INFO
         });
 
-        app.message(async ({ message, client }) => {
-          if (!message || message.channel !== config.slackChannelId) {
-            return;
-          }
+        const sessionQueues = new Map();
 
-          if (message.bot_id || message.subtype === 'bot_message') {
-            return;
-          }
-
-          if (typeof message.text !== 'string' || !message.text.trim()) {
-            return;
-          }
-
+        async function handleMessage(client, message, sessionKey) {
           const threadTs = resolveThreadTs(message);
-          const sessionKey = buildSessionKey(message.channel, threadTs);
 
+          let reactionAdded = false;
           try {
             await safeAddEyesReaction(client, message.channel, message.ts);
+            reactionAdded = true;
           } catch (error) {
             logger.error('Unable to add eyes reaction', error);
           }
@@ -479,7 +476,9 @@ module.exports = {
             } catch {
               // ignore
             }
-            await safeRemoveEyesReaction(client, message.channel, message.ts);
+            if (reactionAdded) {
+              await safeRemoveEyesReaction(client, message.channel, message.ts);
+            }
             return;
           }
 
@@ -615,8 +614,34 @@ module.exports = {
             }
           } finally {
             if (toolWatcher) toolWatcher.close();
-            await safeRemoveEyesReaction(client, message.channel, message.ts);
+            if (reactionAdded) {
+              await safeRemoveEyesReaction(client, message.channel, message.ts);
+            }
           }
+        }
+
+        app.message(async ({ message, client }) => {
+          if (!message || message.channel !== config.slackChannelId) {
+            return;
+          }
+
+          if (message.bot_id || message.subtype === 'bot_message') {
+            return;
+          }
+
+          if (typeof message.text !== 'string' || !message.text.trim()) {
+            return;
+          }
+
+          const threadTs = resolveThreadTs(message);
+          const sessionKey = buildSessionKey(message.channel, threadTs);
+
+          const prev = sessionQueues.get(sessionKey) ?? Promise.resolve();
+          const next = prev.then(() => handleMessage(client, message, sessionKey)).catch(() => {});
+          sessionQueues.set(sessionKey, next);
+          next.finally(() => {
+            if (sessionQueues.get(sessionKey) === next) sessionQueues.delete(sessionKey);
+          });
         });
 
         await app.start(config.port);

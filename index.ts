@@ -455,11 +455,19 @@ async function safeAddEyesReaction(
       name: "eyes",
     });
   } catch (error) {
-    // Ignore known no-op reaction failures so message flow still proceeds.
     const errorCode = (error as any)?.data?.error;
-    if (errorCode !== "already_reacted" && errorCode !== "invalid_name") {
-      throw error;
+    if (errorCode === "already_reacted" || errorCode === "invalid_name") {
+      return;
     }
+    if (
+      errorCode === "ratelimited" ||
+      (error as any)?.code === "slack_webapi_rate_limited_error"
+    ) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 2000));
+      await client.reactions.add({ channel, timestamp, name: "eyes" });
+      return;
+    }
+    throw error;
   }
 }
 
@@ -540,28 +548,15 @@ export default {
           logLevel: LogLevel?.INFO,
         });
 
-        app.message(async ({ message, client }: { message: any; client: any }) => {
-          if (!message) {
-            return;
-          }
+        const sessionQueues = new Map<string, Promise<void>>();
 
-          if (channelId && message.channel !== channelId) {
-            return;
-          }
-
-          if (message.bot_id || message.subtype === "bot_message") {
-            return;
-          }
-
-          if (typeof message.text !== "string" || !message.text.trim()) {
-            return;
-          }
-
+        async function handleMessage(client: any, message: any, sessionKey: string): Promise<void> {
           const threadTs = resolveThreadTs(message);
-          const sessionKey = buildSessionKey(message.channel, threadTs);
 
+          let reactionAdded = false;
           try {
             await safeAddEyesReaction(client, message.channel, message.ts);
+            reactionAdded = true;
           } catch (error) {
             logger.error("Unable to add eyes reaction", error as any);
           }
@@ -586,7 +581,9 @@ export default {
             } catch {
               // ignore
             }
-            await safeRemoveEyesReaction(client, message.channel, message.ts, logger);
+            if (reactionAdded) {
+              await safeRemoveEyesReaction(client, message.channel, message.ts, logger);
+            }
             return;
           }
 
@@ -736,8 +733,38 @@ export default {
             }
           } finally {
             toolWatcher?.close();
-            await safeRemoveEyesReaction(client, message.channel, message.ts, logger);
+            if (reactionAdded) {
+              await safeRemoveEyesReaction(client, message.channel, message.ts, logger);
+            }
           }
+        }
+
+        app.message(async ({ message, client }: { message: any; client: any }) => {
+          if (!message) {
+            return;
+          }
+
+          if (channelId && message.channel !== channelId) {
+            return;
+          }
+
+          if (message.bot_id || message.subtype === "bot_message") {
+            return;
+          }
+
+          if (typeof message.text !== "string" || !message.text.trim()) {
+            return;
+          }
+
+          const threadTs = resolveThreadTs(message);
+          const sessionKey = buildSessionKey(message.channel, threadTs);
+
+          const prev = sessionQueues.get(sessionKey) ?? Promise.resolve();
+          const next = prev.then(() => handleMessage(client, message, sessionKey)).catch(() => {});
+          sessionQueues.set(sessionKey, next);
+          next.finally(() => {
+            if (sessionQueues.get(sessionKey) === next) sessionQueues.delete(sessionKey);
+          });
         });
 
         try {
