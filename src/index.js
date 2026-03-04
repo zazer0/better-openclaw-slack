@@ -11,33 +11,23 @@ if (missingVars.length > 0) {
   process.exit(1);
 }
 
-// OC does not inject plugin config via env vars for standalone CJS plugins.
-// Config priority: env var (if set and non-empty) > schema default.
-function getEnvStr(name, fallback) {
-  const val = process.env[name];
-  return (val !== undefined && val.trim() !== '') ? val.trim() : fallback;
-}
-
-function getEnvInt(name, fallback) {
-  const val = process.env[name];
-  if (val !== undefined && val.trim() !== '') {
-    const n = Number(val.trim());
-    if (Number.isFinite(n)) return n;
-  }
-  return fallback;
-}
+const CHANNEL_ID = 'C0AGCR0USR0';
+const AGENT_ID = 'main';
+const MAX_MESSAGE_LENGTH = 4000;
+const UPDATE_INTERVAL_MS = 1500;
+const INACTIVITY_TIMEOUT_MS = 60000;
 
 const config = {
   slackBotToken: process.env.SLACK_BOT_TOKEN,
   slackAppToken: process.env.SLACK_APP_TOKEN,
-  slackChannelId: getEnvStr('SLACK_CHANNEL_ID', 'C0AGCR0USR0'),
-  openclawGatewayUrl: getEnvStr('OPENCLAW_GATEWAY_URL', 'http://127.0.0.1:18789'),
-  openclawGatewayToken: getEnvStr('OPENCLAW_GATEWAY_TOKEN', 'open-DA-claws-FR'),
-  openclawAgentId: getEnvStr('OPENCLAW_AGENT_ID', 'main'),
-  maxSlackMessageLength: getEnvInt('MAX_MESSAGE_LENGTH', 4000),
-  updateIntervalMs: getEnvInt('UPDATE_INTERVAL_MS', 1500),
-  inactivityTimeoutMs: getEnvInt('INACTIVITY_TIMEOUT_MS', 60000),
-  port: getEnvInt('PORT', 3000),
+  slackChannelId: CHANNEL_ID,
+  openclawGatewayUrl: process.env.OPENCLAW_GATEWAY_URL?.trim() || 'http://127.0.0.1:18789',
+  openclawGatewayToken: process.env.OPENCLAW_GATEWAY_TOKEN?.trim() || 'open-DA-claws-FR',
+  openclawAgentId: AGENT_ID,
+  maxSlackMessageLength: MAX_MESSAGE_LENGTH,
+  updateIntervalMs: UPDATE_INTERVAL_MS,
+  inactivityTimeoutMs: INACTIVITY_TIMEOUT_MS,
+  port: Number(process.env.PORT) || 3000,
 };
 
 const app = new App({

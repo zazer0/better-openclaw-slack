@@ -1,50 +1,13 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 
-type PluginConfig = {
-  channelId?: string;
-  gatewayUrl?: string;
-  agentId?: string;
-  maxMessageLength?: number;
-  updateIntervalMs?: number;
-  inactivityTimeoutMs?: number;
-};
-
 type TimerResetRef = { reset: (() => void) | null };
 type RunIdRef = { value: string | null };
 
-function parseChannelId(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim().length > 0
-    ? value.trim()
-    : undefined;
-}
-
-function parseGatewayUrl(value: unknown): string {
-  if (typeof value === "string" && value.trim()) return value.trim();
-  return "http://127.0.0.1:18789";
-}
-
-function parseAgentId(value: unknown): string {
-  if (typeof value === "string" && value.trim()) return value.trim();
-  return "main";
-}
-
-function parseMaxMessageLength(value: unknown): number {
-  const candidate = Number(value);
-  if (Number.isFinite(candidate) && candidate > 0) return candidate;
-  return 4000;
-}
-
-function parseUpdateIntervalMs(value: unknown): number {
-  const candidate = Number(value);
-  if (Number.isFinite(candidate) && candidate >= 500 && candidate <= 10000) return candidate;
-  return 1500;
-}
-
-function parseInactivityTimeoutMs(value: unknown): number {
-  const candidate = Number(value);
-  if (Number.isFinite(candidate) && candidate >= 5000 && candidate <= 300000) return candidate;
-  return 60000;
-}
+const CHANNEL_ID = "C0AGCR0USR0";
+const AGENT_ID = "main";
+const MAX_MESSAGE_LENGTH = 4000;
+const UPDATE_INTERVAL_MS = 1500;
+const INACTIVITY_TIMEOUT_MS = 60000;
 
 function resolveThreadTs(message: { thread_ts?: string; ts: string }): string {
   return message.thread_ts || message.ts;
@@ -533,14 +496,12 @@ export default {
           return;
         }
 
-        const cfg = (ctx.config ?? {}) as PluginConfig;
-        // Config priority: env var (if set and non-empty) > OC plugin config > schema default.
-        const channelId = parseChannelId(process.env.SLACK_CHANNEL_ID?.trim() || cfg.channelId);
-        const gatewayUrl = parseGatewayUrl(process.env.OPENCLAW_GATEWAY_URL?.trim() || cfg.gatewayUrl);
-        const agentId = parseAgentId(process.env.OPENCLAW_AGENT_ID?.trim() || cfg.agentId);
-        const maxMessageLength = parseMaxMessageLength(process.env.MAX_MESSAGE_LENGTH?.trim() || cfg.maxMessageLength);
-        const updateIntervalMs = parseUpdateIntervalMs(process.env.UPDATE_INTERVAL_MS?.trim() || cfg.updateIntervalMs);
-        const inactivityTimeoutMs = parseInactivityTimeoutMs(process.env.INACTIVITY_TIMEOUT_MS?.trim() || cfg.inactivityTimeoutMs);
+        const channelId = CHANNEL_ID;
+        const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL?.trim() || "http://127.0.0.1:18789";
+        const agentId = AGENT_ID;
+        const maxMessageLength = MAX_MESSAGE_LENGTH;
+        const updateIntervalMs = UPDATE_INTERVAL_MS;
+        const inactivityTimeoutMs = INACTIVITY_TIMEOUT_MS;
 
         let SlackApp;
         let LogLevel;
