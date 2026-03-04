@@ -13,7 +13,7 @@ if (missingVars.length > 0) {
 
 const MAX_MESSAGE_LENGTH = 3000;
 const UPDATE_INTERVAL_MS = 1500;
-const INACTIVITY_TIMEOUT_MS = 60000;
+const INACTIVITY_TIMEOUT_MS = 300000;
 
 function normalizeNoReply(text) {
   if (text.trim().toUpperCase() === 'NO_REPLY') {
@@ -581,9 +581,7 @@ module.exports = {
                 errorText = error?.message || '⚠️ Gateway error';
                 break;
               case 'GATEWAY_STREAM_ERROR':
-                errorText = accumulated
-                  ? `${accumulated}\n\n⚠️ Stream interrupted`
-                  : '⚠️ Gateway stream error';
+                errorText = '⚠️ Stream interrupted';
                 break;
               case 'GATEWAY_TIMEOUT':
                 errorText = '⚠️ Gateway timed out — try again';
@@ -596,18 +594,34 @@ module.exports = {
             }
 
             try {
-              const errorChunks = splitMessage(errorText, config.maxSlackMessageLength);
-              await client.chat.update({
-                channel: message.channel,
-                ts: placeholderTs,
-                text: errorChunks[0]
-              });
-              for (let i = 1; i < errorChunks.length; i++) {
+              // For GATEWAY_TIMEOUT and GATEWAY_STREAM_ERROR with accumulated content:
+              // the placeholder already shows the accumulated text, so post the error
+              // as a follow-up message instead of overwriting it.
+              const hasAccumulated = accumulated.length > 0;
+              const preservePlaceholder =
+                hasAccumulated &&
+                (code === 'GATEWAY_TIMEOUT' || code === 'GATEWAY_STREAM_ERROR');
+
+              if (preservePlaceholder) {
                 await client.chat.postMessage({
                   channel: message.channel,
                   thread_ts: threadTs,
-                  text: errorChunks[i]
+                  text: errorText
                 });
+              } else {
+                const errorChunks = splitMessage(errorText, config.maxSlackMessageLength);
+                await client.chat.update({
+                  channel: message.channel,
+                  ts: placeholderTs,
+                  text: errorChunks[0]
+                });
+                for (let i = 1; i < errorChunks.length; i++) {
+                  await client.chat.postMessage({
+                    channel: message.channel,
+                    thread_ts: threadTs,
+                    text: errorChunks[i]
+                  });
+                }
               }
             } catch (postError) {
               logger.error('Failed to post error message to Slack', postError);
