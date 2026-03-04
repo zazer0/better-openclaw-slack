@@ -15,8 +15,8 @@ const MAX_MESSAGE_LENGTH = 4000;
 const UPDATE_INTERVAL_MS = 1500;
 const INACTIVITY_TIMEOUT_MS = 60000;
 
-function buildConfig(ctx) {
-  const channelId = ctx?.config?.channelId?.trim();
+function buildConfig(api) {
+  const channelId = api?.pluginConfig?.channelId?.trim();
   if (!channelId) {
     console.error('better-openclaw-slack: channelId is required in plugin config');
     return null;
@@ -27,7 +27,7 @@ function buildConfig(ctx) {
     slackChannelId: channelId,
     openclawGatewayUrl: process.env.OPENCLAW_GATEWAY_URL?.trim() || 'http://127.0.0.1:18789',
     openclawGatewayToken: process.env.OPENCLAW_GATEWAY_TOKEN?.trim() || 'open-DA-claws-FR',
-    openclawAgentId: ctx?.config?.agentId?.trim() || 'main',
+    openclawAgentId: api?.pluginConfig?.agentId?.trim() || 'main',
     maxSlackMessageLength: MAX_MESSAGE_LENGTH,
     updateIntervalMs: UPDATE_INTERVAL_MS,
     inactivityTimeoutMs: INACTIVITY_TIMEOUT_MS,
@@ -177,7 +177,7 @@ module.exports = {
     api.registerService({
       name: 'better-openclaw-slack',
       start: async (ctx) => {
-        const config = buildConfig(ctx);
+        const config = buildConfig(api);
         if (!config) {
           throw new Error('better-openclaw-slack: invalid config, cannot start');
         }

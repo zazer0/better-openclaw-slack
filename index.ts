@@ -495,7 +495,7 @@ export default {
           return;
         }
 
-        const pluginConfig = ctx.config as PluginConfig;
+        const pluginConfig = api.pluginConfig as PluginConfig;
         const channelId = pluginConfig.channelId?.trim();
         if (!channelId) {
           logger.error("better-openclaw-slack: channelId is required in plugin config");
