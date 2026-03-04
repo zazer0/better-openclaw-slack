@@ -35,15 +35,6 @@ function buildConfig(ctx) {
   };
 }
 
-const config = buildConfig(typeof ctx !== 'undefined' ? ctx : null);
-
-const app = new App({
-  token: config.slackBotToken,
-  appToken: config.slackAppToken,
-  socketMode: true,
-  logLevel: LogLevel.INFO
-});
-
 function resolveThreadTs(message) {
   return message.thread_ts || message.ts;
 }
@@ -181,458 +172,447 @@ function throttledSlackUpdater({ client, channel, placeholderTs, updateIntervalM
   };
 }
 
-async function* queryOpenClaw({ sessionKey, userText, inactivityTimeoutMsRef, timerResetRef, runIdRef }) {
-  const ac = new AbortController();
-  const endpoint = `${config.openclawGatewayUrl.replace(/\/$/, '')}/v1/chat/completions`;
-  const body = {
-    model: 'openclaw',
-    messages: [{ role: 'user', content: userText }],
-    user: sessionKey,
-    stream: true
-  };
-
-  let response;
-  try {
-    response = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${config.openclawGatewayToken}`,
-        'x-openclaw-agent-id': config.openclawAgentId,
-        'x-openclaw-session-key': sessionKey
-      },
-      body: JSON.stringify(body),
-      signal: ac.signal
-    });
-  } catch (error) {
-    throw makeError('GATEWAY_UNAVAILABLE', 'Gateway unavailable', { cause: error });
-  }
-
-  if (!response.ok) {
-    const responseText = await response.text();
-    throw makeError('GATEWAY_ERROR', parseGatewayError(response.status, responseText), {
-      status: response.status
-    });
-  }
-
-  const contentType = response.headers.get('content-type') ?? '';
-  if (!contentType.startsWith('text/event-stream')) {
-    // Graceful fallback: gateway ignored stream: true, returned non-SSE response.
-    try {
-      const responseText = await response.text();
-      const parsed = JSON.parse(responseText);
-      const content = parsed?.choices?.[0]?.message?.content;
-      if (typeof content === 'string' && content.trim()) {
-        console.warn(
-          'better-openclaw-slack: gateway returned non-SSE response, falling back to non-streaming parse'
-        );
-        yield content;
-        return;
-      }
-    } catch {
-      // fall through to throw GATEWAY_STREAM_ERROR
-    }
-    throw makeError('GATEWAY_STREAM_ERROR', '⚠️ Gateway stream error');
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let hasContent = false;
-  let lineBuffer = '';
-
-  try {
-    while (true) {
-      const chunk = await readWithInactivityTimeout(
-        reader,
-        inactivityTimeoutMsRef,
-        ac,
-        timerResetRef
-          ? (reset) => { timerResetRef.reset = reset; }
-          : undefined
-      );
-
-      if (chunk.done) {
-        if (hasContent) return;
-        throw makeError('GATEWAY_EMPTY_STREAM', '⚠️ Gateway returned an empty reply');
-      }
-
-      lineBuffer += decoder.decode(chunk.value, { stream: true });
-      const lines = lineBuffer.split('\n');
-      lineBuffer = lines.pop();
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith('data:')) continue;
-        const dataStr = trimmed.slice('data:'.length).trim();
-        if (dataStr === '[DONE]') return;
-        try {
-          const parsed = JSON.parse(dataStr);
-
-          // Extract runId from first SSE event that carries an id.
-          if (runIdRef && runIdRef.value === null && parsed.id) {
-            runIdRef.value = String(parsed.id);
-          }
-
-          const delta = parsed?.choices?.[0]?.delta?.content;
-          if (typeof delta === 'string' && delta.length > 0) {
-            hasContent = true;
-            yield delta;
-          }
-        } catch {
-          // Skip malformed SSE data lines.
+module.exports = {
+  register(api) {
+    api.registerService({
+      name: 'better-openclaw-slack',
+      start: async (ctx) => {
+        const config = buildConfig(ctx);
+        if (!config) {
+          throw new Error('better-openclaw-slack: invalid config, cannot start');
         }
-      }
-    }
-  } finally {
-    reader.releaseLock();
-  }
-}
 
-// Opens a parallel WebSocket to the gateway to receive tool events for the current run.
-// Calls onToolStart when a tool.start event arrives (filtered by runId).
-// Resets the inactivity timer on every tool event.
-// Returns a cleanup handle. Rejects if the WS cannot connect/authenticate.
-async function openToolWatcher({ gatewayUrl, gatewayToken, runIdRef, timerResetRef, onConnected, onToolStart, logger }) {
-  const wsUrl = gatewayUrl
-    .replace(/^https:\/\//i, 'wss://')
-    .replace(/^http:\/\//i, 'ws://')
-    .replace(/\/+$/, '');
+        const logger = ctx.logger || console;
 
-  return new Promise((resolve, reject) => {
-    let connected = false;
-    let ws;
-
-    try {
-      ws = new WebSocket(wsUrl, { maxPayload: 25 * 1024 * 1024 });
-    } catch (err) {
-      reject(err);
-      return;
-    }
-
-    const connectTimeout = setTimeout(() => {
-      try { ws.terminate(); } catch {}
-      reject(new Error('WS connect timeout'));
-    }, 8000);
-
-    const closeWs = () => {
-      clearTimeout(connectTimeout);
-      try { ws.close(); } catch {}
-    };
-
-    ws.on('error', (err) => {
-      if (!connected) {
-        clearTimeout(connectTimeout);
-        reject(err);
-      }
-      // After connection: ignore errors, WS will close.
-    });
-
-    ws.on('close', () => {
-      clearTimeout(connectTimeout);
-      if (!connected) {
-        reject(new Error('WS closed before auth'));
-      }
-    });
-
-    ws.on('message', (data) => {
-      let msg;
-      try {
-        const raw = typeof data === 'string' ? data : data.toString('utf8');
-        msg = JSON.parse(raw);
-      } catch {
-        return;
-      }
-
-      if (!connected) {
-        // Handshake: wait for connect.challenge, then send connect request.
-        if (msg.type === 'event' && msg.event === 'connect.challenge') {
-          const connectParams = {
-            minProtocol: 3,
-            maxProtocol: 3,
-            client: {
-              id: 'gateway-client',
-              displayName: 'slack-bridge',
-              version: 'dev',
-              platform: process.platform,
-              mode: 'backend'
-            },
-            caps: ['tool-events'],
-            role: 'operator',
-            scopes: ['operator.admin']
+        async function* queryOpenClaw({ sessionKey, userText, inactivityTimeoutMsRef, timerResetRef, runIdRef }) {
+          const ac = new AbortController();
+          const endpoint = `${config.openclawGatewayUrl.replace(/\/$/, '')}/v1/chat/completions`;
+          const body = {
+            model: 'openclaw',
+            messages: [{ role: 'user', content: userText }],
+            user: sessionKey,
+            stream: true
           };
-          if (gatewayToken) {
-            connectParams.auth = { token: gatewayToken };
-          }
+
+          let response;
           try {
-            ws.send(JSON.stringify({ type: 'req', id: 'c1', method: 'connect', params: connectParams }));
-          } catch {}
-          return;
-        }
-
-        if (msg.type === 'res' && msg.id === 'c1') {
-          clearTimeout(connectTimeout);
-          if (msg.ok) {
-            connected = true;
-            if (onConnected) onConnected();
-            resolve({ close: closeWs });
-          } else {
-            reject(new Error(`WS auth failed: ${msg.error?.message ?? 'unknown'}`));
-            try { ws.close(); } catch {}
+            response = await fetch(endpoint, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${config.openclawGatewayToken}`,
+                'x-openclaw-agent-id': config.openclawAgentId,
+                'x-openclaw-session-key': sessionKey
+              },
+              body: JSON.stringify(body),
+              signal: ac.signal
+            });
+          } catch (error) {
+            throw makeError('GATEWAY_UNAVAILABLE', 'Gateway unavailable', { cause: error });
           }
-          return;
+
+          if (!response.ok) {
+            const responseText = await response.text();
+            throw makeError('GATEWAY_ERROR', parseGatewayError(response.status, responseText), {
+              status: response.status
+            });
+          }
+
+          const contentType = response.headers.get('content-type') ?? '';
+          if (!contentType.startsWith('text/event-stream')) {
+            try {
+              const responseText = await response.text();
+              const parsed = JSON.parse(responseText);
+              const content = parsed?.choices?.[0]?.message?.content;
+              if (typeof content === 'string' && content.trim()) {
+                logger.warn('better-openclaw-slack: gateway returned non-SSE response, falling back to non-streaming parse');
+                yield content;
+                return;
+              }
+            } catch {
+              // fall through to throw GATEWAY_STREAM_ERROR
+            }
+            throw makeError('GATEWAY_STREAM_ERROR', '⚠️ Gateway stream error');
+          }
+
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let hasContent = false;
+          let lineBuffer = '';
+
+          try {
+            while (true) {
+              const chunk = await readWithInactivityTimeout(
+                reader,
+                inactivityTimeoutMsRef,
+                ac,
+                timerResetRef
+                  ? (reset) => { timerResetRef.reset = reset; }
+                  : undefined
+              );
+
+              if (chunk.done) {
+                if (hasContent) return;
+                throw makeError('GATEWAY_EMPTY_STREAM', '⚠️ Gateway returned an empty reply');
+              }
+
+              lineBuffer += decoder.decode(chunk.value, { stream: true });
+              const lines = lineBuffer.split('\n');
+              lineBuffer = lines.pop();
+
+              for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed.startsWith('data:')) continue;
+                const dataStr = trimmed.slice('data:'.length).trim();
+                if (dataStr === '[DONE]') return;
+                try {
+                  const parsed = JSON.parse(dataStr);
+
+                  if (runIdRef && runIdRef.value === null && parsed.id) {
+                    runIdRef.value = String(parsed.id);
+                  }
+
+                  const delta = parsed?.choices?.[0]?.delta?.content;
+                  if (typeof delta === 'string' && delta.length > 0) {
+                    hasContent = true;
+                    yield delta;
+                  }
+                } catch {
+                  // Skip malformed SSE data lines.
+                }
+              }
+            }
+          } finally {
+            reader.releaseLock();
+          }
         }
-        return;
-      }
 
-      // Connected: handle agent events.
-      if (msg.type !== 'event' || msg.event !== 'agent') return;
-      const payload = msg.payload;
-      if (!payload || typeof payload !== 'object') return;
-      if (payload.stream !== 'tool') return;
-      // Filter by runId once it becomes known from the SSE stream.
-      if (runIdRef.value !== null && payload.runId !== runIdRef.value) return;
+        async function openToolWatcher({ gatewayUrl, gatewayToken, runIdRef, timerResetRef, onConnected, onToolStart }) {
+          const wsUrl = gatewayUrl
+            .replace(/^https:\/\//i, 'wss://')
+            .replace(/^http:\/\//i, 'ws://')
+            .replace(/\/+$/, '');
 
-      // Reset inactivity timer on every tool event.
-      if (timerResetRef.reset) timerResetRef.reset();
+          return new Promise((resolve, reject) => {
+            let connected = false;
+            let ws;
 
-      const phase = payload.data?.phase;
-      const toolName = payload.data?.name;
-      if (phase === 'start' && typeof toolName === 'string' && toolName.trim()) {
-        onToolStart(toolName.trim());
-      }
-    });
-  });
-}
+            try {
+              ws = new WebSocket(wsUrl, { maxPayload: 25 * 1024 * 1024 });
+            } catch (err) {
+              reject(err);
+              return;
+            }
 
-async function safeAddEyesReaction(client, channel, timestamp) {
-  try {
-    await client.reactions.add({
-      channel,
-      timestamp,
-      name: 'eyes'
-    });
-  } catch (error) {
-    // Ignore known no-op reaction failures so message flow still proceeds.
-    const errorCode = error?.data?.error;
-    if (errorCode !== 'already_reacted' && errorCode !== 'invalid_name') {
-      throw error;
-    }
-  }
-}
+            const connectTimeout = setTimeout(() => {
+              try { ws.terminate(); } catch {}
+              reject(new Error('WS connect timeout'));
+            }, 8000);
 
-async function safeRemoveEyesReaction(client, channel, timestamp, logger) {
-  try {
-    await client.reactions.remove({
-      channel,
-      timestamp,
-      name: 'eyes'
-    });
-  } catch (error) {
-    // Ignore cleanup errors; bot response should not fail because reaction removal failed.
-    const errorCode = error?.data?.error;
-    if (errorCode !== 'no_reaction' && errorCode !== 'message_not_found') {
-      logger.error('Failed to remove eyes reaction:', errorCode || error.message || error);
-    }
-  }
-}
+            const closeWs = () => {
+              clearTimeout(connectTimeout);
+              try { ws.close(); } catch {}
+            };
 
-app.message(async ({ message, client, logger }) => {
-  if (!message || message.channel !== config.slackChannelId) {
-    return;
-  }
+            ws.on('error', (err) => {
+              if (!connected) {
+                clearTimeout(connectTimeout);
+                reject(err);
+              }
+            });
 
-  if (message.bot_id || message.subtype === 'bot_message') {
-    return;
-  }
+            ws.on('close', () => {
+              clearTimeout(connectTimeout);
+              if (!connected) {
+                reject(new Error('WS closed before auth'));
+              }
+            });
 
-  if (typeof message.text !== 'string' || !message.text.trim()) {
-    return;
-  }
+            ws.on('message', (data) => {
+              let msg;
+              try {
+                const raw = typeof data === 'string' ? data : data.toString('utf8');
+                msg = JSON.parse(raw);
+              } catch {
+                return;
+              }
 
-  const threadTs = resolveThreadTs(message);
-  const sessionKey = buildSessionKey(message.channel, threadTs);
+              if (!connected) {
+                if (msg.type === 'event' && msg.event === 'connect.challenge') {
+                  const connectParams = {
+                    minProtocol: 3,
+                    maxProtocol: 3,
+                    client: {
+                      id: 'gateway-client',
+                      displayName: 'slack-bridge',
+                      version: 'dev',
+                      platform: process.platform,
+                      mode: 'backend'
+                    },
+                    caps: ['tool-events'],
+                    role: 'operator',
+                    scopes: ['operator.admin']
+                  };
+                  if (gatewayToken) {
+                    connectParams.auth = { token: gatewayToken };
+                  }
+                  try {
+                    ws.send(JSON.stringify({ type: 'req', id: 'c1', method: 'connect', params: connectParams }));
+                  } catch {}
+                  return;
+                }
 
-  try {
-    await safeAddEyesReaction(client, message.channel, message.ts);
-  } catch (error) {
-    logger.error('Unable to add eyes reaction', error);
-  }
+                if (msg.type === 'res' && msg.id === 'c1') {
+                  clearTimeout(connectTimeout);
+                  if (msg.ok) {
+                    connected = true;
+                    if (onConnected) onConnected();
+                    resolve({ close: closeWs });
+                  } else {
+                    reject(new Error(`WS auth failed: ${msg.error?.message ?? 'unknown'}`));
+                    try { ws.close(); } catch {}
+                  }
+                  return;
+                }
+                return;
+              }
 
-  // Post placeholder; if this fails, abort without starting gateway fetch.
-  let placeholderTs;
-  try {
-    const placeholderResult = await client.chat.postMessage({
-      channel: message.channel,
-      thread_ts: threadTs,
-      text: '_⏳ Working..._'
-    });
-    placeholderTs = placeholderResult.ts;
-  } catch (placeholderError) {
-    logger.error('Failed to post placeholder message', placeholderError);
-    try {
-      await client.chat.postMessage({
-        channel: message.channel,
-        thread_ts: threadTs,
-        text: '⚠️ Failed to post message to Slack'
-      });
-    } catch {
-      // ignore
-    }
-    await safeRemoveEyesReaction(client, message.channel, message.ts, logger);
-    return;
-  }
+              if (msg.type !== 'event' || msg.event !== 'agent') return;
+              const payload = msg.payload;
+              if (!payload || typeof payload !== 'object') return;
+              if (payload.stream !== 'tool') return;
+              if (runIdRef.value !== null && payload.runId !== runIdRef.value) return;
 
-  const timerResetRef = { reset: null };
-  const runIdRef = { value: null };
-  const timeoutMsRef = { ms: config.inactivityTimeoutMs };
-  const toolNames = [];
-  let toolWatcher = null;
+              if (timerResetRef.reset) timerResetRef.reset();
 
-  let accumulated = '';
-  const updater = throttledSlackUpdater({
-    client,
-    channel: message.channel,
-    placeholderTs,
-    updateIntervalMs: config.updateIntervalMs,
-    logger
-  });
-
-  // Start WS tool watcher in background; gracefully degrade if it fails.
-  openToolWatcher({
-    gatewayUrl: config.openclawGatewayUrl,
-    gatewayToken: config.openclawGatewayToken,
-    runIdRef,
-    timerResetRef,
-    onConnected: () => {
-      // WS auth succeeded — gateway is alive. Use a long timeout for the rest of the stream.
-      timeoutMsRef.ms = 600000;
-    },
-    onToolStart: (toolName) => {
-      if (!toolNames.includes(toolName)) {
-        toolNames.push(toolName);
-      }
-      updater.setWorkingText(`_🔧 Working... (${toolNames.join(', ')})_`);
-    },
-    logger
-  })
-    .then((watcher) => {
-      toolWatcher = watcher;
-    })
-    .catch(() => {
-      logger.warn('tool-watcher: WS unavailable, tool visibility disabled');
-    });
-
-  try {
-    for await (const delta of queryOpenClaw({
-      sessionKey,
-      userText: message.text,
-      inactivityTimeoutMsRef: timeoutMsRef,
-      timerResetRef,
-      runIdRef
-    })) {
-      accumulated += delta;
-      updater.onDelta(accumulated);
-    }
-
-    updater.stop();
-
-    // Final update: replace placeholder with first chunk, post overflow as new messages.
-    const finalText = accumulated || '⚠️ Gateway returned an empty reply';
-    const chunks = splitMessage(finalText, config.maxSlackMessageLength);
-
-    try {
-      await client.chat.update({
-        channel: message.channel,
-        ts: placeholderTs,
-        text: chunks[0]
-      });
-    } catch (err) {
-      if (err?.data?.error === 'ratelimited' || err?.code === 'slack_webapi_rate_limited_error') {
-        logger.warn('Final chat.update rate limited, retrying after 2s');
-        await new Promise((resolve) => setTimeout(resolve, 2000));
-        try {
-          await client.chat.update({
-            channel: message.channel,
-            ts: placeholderTs,
-            text: chunks[0]
-          });
-        } catch {
-          await client.chat.postMessage({
-            channel: message.channel,
-            thread_ts: threadTs,
-            text: chunks[0]
+              const phase = payload.data?.phase;
+              const toolName = payload.data?.name;
+              if (phase === 'start' && typeof toolName === 'string' && toolName.trim()) {
+                onToolStart(toolName.trim());
+              }
+            });
           });
         }
-      } else {
-        throw err;
-      }
-    }
 
-    for (let i = 1; i < chunks.length; i++) {
-      await client.chat.postMessage({
-        channel: message.channel,
-        thread_ts: threadTs,
-        text: chunks[i]
-      });
-    }
-  } catch (error) {
-    updater.stop();
-    logger.error('Message handling failed', error);
+        async function safeAddEyesReaction(client, channel, timestamp) {
+          try {
+            await client.reactions.add({ channel, timestamp, name: 'eyes' });
+          } catch (error) {
+            const errorCode = error?.data?.error;
+            if (errorCode !== 'already_reacted' && errorCode !== 'invalid_name') {
+              throw error;
+            }
+          }
+        }
 
-    const code = error?.code;
-    let errorText;
-    switch (code) {
-      case 'GATEWAY_UNAVAILABLE':
-        errorText = '⚠️ Gateway unavailable, try again later';
-        break;
-      case 'GATEWAY_ERROR':
-        errorText = error?.message || '⚠️ Gateway error';
-        break;
-      case 'GATEWAY_STREAM_ERROR':
-        errorText = accumulated
-          ? `${accumulated}\n\n⚠️ Stream interrupted`
-          : '⚠️ Gateway stream error';
-        break;
-      case 'GATEWAY_TIMEOUT':
-        errorText = '⚠️ Gateway timed out — try again';
-        break;
-      case 'GATEWAY_EMPTY_STREAM':
-        errorText = '⚠️ Gateway returned an empty reply';
-        break;
-      default:
-        errorText = error?.message || '⚠️ Unexpected error';
-    }
+        async function safeRemoveEyesReaction(client, channel, timestamp) {
+          try {
+            await client.reactions.remove({ channel, timestamp, name: 'eyes' });
+          } catch (error) {
+            const errorCode = error?.data?.error;
+            if (errorCode !== 'no_reaction' && errorCode !== 'message_not_found') {
+              logger.error('Failed to remove eyes reaction:', errorCode || error.message || error);
+            }
+          }
+        }
 
-    try {
-      const errorChunks = splitMessage(errorText, config.maxSlackMessageLength);
-      await client.chat.update({
-        channel: message.channel,
-        ts: placeholderTs,
-        text: errorChunks[0]
-      });
-      for (let i = 1; i < errorChunks.length; i++) {
-        await client.chat.postMessage({
-          channel: message.channel,
-          thread_ts: threadTs,
-          text: errorChunks[i]
+        const app = new App({
+          token: config.slackBotToken,
+          appToken: config.slackAppToken,
+          socketMode: true,
+          logLevel: LogLevel.INFO
         });
-      }
-    } catch (postError) {
-      logger.error('Failed to post error message to Slack', postError);
-    }
-  } finally {
-    if (toolWatcher) toolWatcher.close();
-    await safeRemoveEyesReaction(client, message.channel, message.ts, logger);
-  }
-});
 
-(async () => {
-  try {
-    await app.start(config.port);
-    console.log('Molty Slack bot is running');
-    console.log(`Listening in channel: ${config.slackChannelId}`);
-  } catch (error) {
-    console.error('Failed to start app:', error);
-    process.exit(1);
+        app.message(async ({ message, client }) => {
+          if (!message || message.channel !== config.slackChannelId) {
+            return;
+          }
+
+          if (message.bot_id || message.subtype === 'bot_message') {
+            return;
+          }
+
+          if (typeof message.text !== 'string' || !message.text.trim()) {
+            return;
+          }
+
+          const threadTs = resolveThreadTs(message);
+          const sessionKey = buildSessionKey(message.channel, threadTs);
+
+          try {
+            await safeAddEyesReaction(client, message.channel, message.ts);
+          } catch (error) {
+            logger.error('Unable to add eyes reaction', error);
+          }
+
+          let placeholderTs;
+          try {
+            const placeholderResult = await client.chat.postMessage({
+              channel: message.channel,
+              thread_ts: threadTs,
+              text: '_⏳ Working..._'
+            });
+            placeholderTs = placeholderResult.ts;
+          } catch (placeholderError) {
+            logger.error('Failed to post placeholder message', placeholderError);
+            try {
+              await client.chat.postMessage({
+                channel: message.channel,
+                thread_ts: threadTs,
+                text: '⚠️ Failed to post message to Slack'
+              });
+            } catch {
+              // ignore
+            }
+            await safeRemoveEyesReaction(client, message.channel, message.ts);
+            return;
+          }
+
+          const timerResetRef = { reset: null };
+          const runIdRef = { value: null };
+          const timeoutMsRef = { ms: config.inactivityTimeoutMs };
+          const toolNames = [];
+          let toolWatcher = null;
+
+          let accumulated = '';
+          const updater = throttledSlackUpdater({
+            client,
+            channel: message.channel,
+            placeholderTs,
+            updateIntervalMs: config.updateIntervalMs,
+            logger
+          });
+
+          openToolWatcher({
+            gatewayUrl: config.openclawGatewayUrl,
+            gatewayToken: config.openclawGatewayToken,
+            runIdRef,
+            timerResetRef,
+            onConnected: () => {
+              timeoutMsRef.ms = 600000;
+            },
+            onToolStart: (toolName) => {
+              if (!toolNames.includes(toolName)) {
+                toolNames.push(toolName);
+              }
+              updater.setWorkingText(`_🔧 Working... (${toolNames.join(', ')})_`);
+            }
+          })
+            .then((watcher) => { toolWatcher = watcher; })
+            .catch(() => { logger.warn('tool-watcher: WS unavailable, tool visibility disabled'); });
+
+          try {
+            for await (const delta of queryOpenClaw({
+              sessionKey,
+              userText: message.text,
+              inactivityTimeoutMsRef: timeoutMsRef,
+              timerResetRef,
+              runIdRef
+            })) {
+              accumulated += delta;
+              updater.onDelta(accumulated);
+            }
+
+            updater.stop();
+
+            const finalText = accumulated || '⚠️ Gateway returned an empty reply';
+            const chunks = splitMessage(finalText, config.maxSlackMessageLength);
+
+            try {
+              await client.chat.update({
+                channel: message.channel,
+                ts: placeholderTs,
+                text: chunks[0]
+              });
+            } catch (err) {
+              if (err?.data?.error === 'ratelimited' || err?.code === 'slack_webapi_rate_limited_error') {
+                logger.warn('Final chat.update rate limited, retrying after 2s');
+                await new Promise((resolve) => setTimeout(resolve, 2000));
+                try {
+                  await client.chat.update({
+                    channel: message.channel,
+                    ts: placeholderTs,
+                    text: chunks[0]
+                  });
+                } catch {
+                  await client.chat.postMessage({
+                    channel: message.channel,
+                    thread_ts: threadTs,
+                    text: chunks[0]
+                  });
+                }
+              } else {
+                throw err;
+              }
+            }
+
+            for (let i = 1; i < chunks.length; i++) {
+              await client.chat.postMessage({
+                channel: message.channel,
+                thread_ts: threadTs,
+                text: chunks[i]
+              });
+            }
+          } catch (error) {
+            updater.stop();
+            logger.error('Message handling failed', error);
+
+            const code = error?.code;
+            let errorText;
+            switch (code) {
+              case 'GATEWAY_UNAVAILABLE':
+                errorText = '⚠️ Gateway unavailable, try again later';
+                break;
+              case 'GATEWAY_ERROR':
+                errorText = error?.message || '⚠️ Gateway error';
+                break;
+              case 'GATEWAY_STREAM_ERROR':
+                errorText = accumulated
+                  ? `${accumulated}\n\n⚠️ Stream interrupted`
+                  : '⚠️ Gateway stream error';
+                break;
+              case 'GATEWAY_TIMEOUT':
+                errorText = '⚠️ Gateway timed out — try again';
+                break;
+              case 'GATEWAY_EMPTY_STREAM':
+                errorText = '⚠️ Gateway returned an empty reply';
+                break;
+              default:
+                errorText = error?.message || '⚠️ Unexpected error';
+            }
+
+            try {
+              const errorChunks = splitMessage(errorText, config.maxSlackMessageLength);
+              await client.chat.update({
+                channel: message.channel,
+                ts: placeholderTs,
+                text: errorChunks[0]
+              });
+              for (let i = 1; i < errorChunks.length; i++) {
+                await client.chat.postMessage({
+                  channel: message.channel,
+                  thread_ts: threadTs,
+                  text: errorChunks[i]
+                });
+              }
+            } catch (postError) {
+              logger.error('Failed to post error message to Slack', postError);
+            }
+          } finally {
+            if (toolWatcher) toolWatcher.close();
+            await safeRemoveEyesReaction(client, message.channel, message.ts);
+          }
+        });
+
+        await app.start(config.port);
+        logger.info('better-openclaw-slack: Slack bot started');
+        logger.info(`better-openclaw-slack: Listening in channel: ${config.slackChannelId}`);
+      },
+
+      stop: async (ctx) => {
+        const logger = ctx?.logger || console;
+        logger.info('better-openclaw-slack: stopped');
+      }
+    });
   }
-})();
+};
