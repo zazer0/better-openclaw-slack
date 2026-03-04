@@ -51,8 +51,7 @@ Without these event subscriptions, the bot will not receive any messages from Sl
 4. `git clone https://github.com/zazer0/better-openclaw-slack`
 5. `cd ~/.openclaw/extensions/better-openclaw-slack`
 6. `npm install`
-7. Create `.env` exactly as below in the extension directory:
-   - `~/.openclaw/extensions/better-openclaw-slack/.env`
+7. Inject environment variables into the gateway systemd service (see "Environment Variables" section below).
 8. Enable the gateway chat completions endpoint (see "Enable Gateway Chat Completions Endpoint" section below).
 9. Add the plugin entry to `openclaw.json` using the exact JSON block below.
 10. Restart the gateway with this exact command:
@@ -88,19 +87,26 @@ The `x-oauth-scopes` response header lists all scopes granted to the token as a 
 
 ---
 
-## Exact `.env` file
-Create exactly this file at:
-`~/.openclaw/extensions/better-openclaw-slack/.env`
+## Environment Variables
+
+The plugin requires `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, and `OPENCLAW_GATEWAY_TOKEN` to be present as environment variables in the gateway process. **A `.env` file in the extension directory is not sufficient** — the variables must be injected into the systemd service.
+
+Create a systemd drop-in:
 
 ```bash
-cat > ~/.openclaw/extensions/better-openclaw-slack/.env <<'ENVEOF'
-SLACK_BOT_TOKEN=<SLACK_BOT_TOKEN>
-SLACK_APP_TOKEN=<SLACK_APP_TOKEN>
-OPENCLAW_GATEWAY_TOKEN=<OPENCLAW_GATEWAY_TOKEN>
+mkdir -p ~/.config/systemd/user/openclaw-gateway.service.d
+cat > ~/.config/systemd/user/openclaw-gateway.service.d/slack-env.conf << 'ENVEOF'
+[Service]
+Environment=SLACK_BOT_TOKEN=<SLACK_BOT_TOKEN>
+Environment=SLACK_APP_TOKEN=<SLACK_APP_TOKEN>
+Environment=OPENCLAW_GATEWAY_TOKEN=<OPENCLAW_GATEWAY_TOKEN>
 ENVEOF
+systemctl --user daemon-reload
 ```
 
 Replace `<SLACK_BOT_TOKEN>`, `<SLACK_APP_TOKEN>`, and `<OPENCLAW_GATEWAY_TOKEN>` with the values the human provides.
+
+The `.env` file in the repo root is for reference only — it lists the required variable names but is not loaded by the running plugin.
 
 ## Exact JSON to add to `openclaw.json`
 Merge this into your `openclaw.json`. The key under `plugins.entries` must be `better-openclaw-slack`:
