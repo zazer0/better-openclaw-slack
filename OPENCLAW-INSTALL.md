@@ -186,3 +186,26 @@ systemctl --user restart openclaw-gateway || openclaw gateway restart
 ```
 
 **Why step 2?** The repo's canonical source is `index.ts` (TypeScript) with a CJS mirror at `src/index.js`. OC loads `index.js` from the top-level directory. There is no build step — deploying means copying `src/index.js` to `index.js`. If you skip this, the old version keeps running even after a pull.
+
+
+### ⚠️ New instance? Disable the native Slack channel
+
+If this is a fresh OpenClaw install, the OC setup wizard may have enabled the native `channels.slack` provider. **Running both the native Slack channel and this plugin simultaneously causes conflicts** — intermittent eye reactions, dropped messages, and unpredictable behavior.
+
+Check your `openclaw.json` and ensure `channels.slack.enabled` is `false` (or the `slack` block is absent entirely):
+
+```json
+{
+  "channels": {
+    "slack": {
+      "enabled": false
+    }
+  }
+}
+```
+
+After making this change, restart the gateway. Confirm the logs show only:
+```
+[plugins] slack-bridge: running — listening in channel <your-channel-id>
+```
+and **no** `[slack] [default] starting provider` line.

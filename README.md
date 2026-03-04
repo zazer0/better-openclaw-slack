@@ -76,3 +76,14 @@ Mention the bot or reply in threads in the configured channel. The bridge routes
 - Do not commit `.env` or tokens.
 - Rotate tokens if accidentally exposed.
 - Use least-privilege scopes.
+
+## Updating
+
+```bash
+cd ~/.openclaw/extensions/better-openclaw-slack
+git pull origin main
+cp src/index.js index.js  # required — OC loads index.js, not src/index.js
+systemctl --user restart openclaw-gateway || openclaw gateway restart
+```
+
+> **Note:** If this is a new OC instance, make sure `channels.slack.enabled` is `false` in your `openclaw.json`. Running both the native Slack channel and this plugin simultaneously causes conflicts (intermittent reactions, dropped messages). See `OPENCLAW-INSTALL.md` for details.
