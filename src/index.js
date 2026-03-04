@@ -11,9 +11,16 @@ if (missingVars.length > 0) {
   process.exit(1);
 }
 
-const MAX_MESSAGE_LENGTH = 4000;
+const MAX_MESSAGE_LENGTH = 3000;
 const UPDATE_INTERVAL_MS = 1500;
 const INACTIVITY_TIMEOUT_MS = 60000;
+
+function normalizeNoReply(text) {
+  if (text.trim().toUpperCase() === 'NO_REPLY') {
+    return '🤫 [Model chose NO_REPLY]';
+  }
+  return text;
+}
 
 function buildConfig(api) {
   const channelId = api?.pluginConfig?.channelId?.trim();
@@ -132,8 +139,14 @@ function throttledSlackUpdater({ client, channel, placeholderTs, updateIntervalM
 
   function scheduleInterval() {
     intervalId = setInterval(async () => {
-      const current = pendingText;
+      let current = pendingText;
       if (current === lastPosted) return;
+
+      // Truncate to 3000 chars if needed, showing the LAST 3000 chars
+      if (current.length > 3000) {
+        current = '…' + current.slice(-3000);
+      }
+
       try {
         await client.chat.update({
           channel,
@@ -147,6 +160,8 @@ function throttledSlackUpdater({ client, channel, placeholderTs, updateIntervalM
           clearInterval(intervalId);
           currentIntervalMs = Math.min(currentIntervalMs * 2, 10000);
           scheduleInterval();
+        } else if (err?.data?.error === 'msg_too_long') {
+          // Silently skip this window
         } else {
           logger.warn('chat.update failed, skipping window', err?.message || String(err));
         }
@@ -224,9 +239,9 @@ module.exports = {
               const responseText = await response.text();
               const parsed = JSON.parse(responseText);
               const content = parsed?.choices?.[0]?.message?.content;
-              if (typeof content === 'string' && content.trim()) {
+              if (typeof content === 'string' && (content.trim() || content.trim().toUpperCase() === 'NO_REPLY')) {
                 logger.warn('better-openclaw-slack: gateway returned non-SSE response, falling back to non-streaming parse');
-                yield content;
+                yield normalizeNoReply(content);
                 return;
               }
             } catch {
@@ -515,7 +530,7 @@ module.exports = {
 
             updater.stop();
 
-            const finalText = accumulated || '⚠️ Gateway returned an empty reply';
+            const finalText = normalizeNoReply(accumulated) || '⚠️ Gateway returned an empty reply';
             const chunks = splitMessage(finalText, config.maxSlackMessageLength);
 
             try {

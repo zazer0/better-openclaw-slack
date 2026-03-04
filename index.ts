@@ -4,9 +4,16 @@ type TimerResetRef = { reset: (() => void) | null };
 type RunIdRef = { value: string | null };
 type PluginConfig = { channelId?: string; agentId?: string };
 
-const MAX_MESSAGE_LENGTH = 4000;
+const MAX_MESSAGE_LENGTH = 3000;
 const UPDATE_INTERVAL_MS = 1500;
 const INACTIVITY_TIMEOUT_MS = 60000;
+
+function normalizeNoReply(text: string): string {
+  if (text.trim().toUpperCase() === "NO_REPLY") {
+    return "🤫 [Model chose NO_REPLY]";
+  }
+  return text;
+}
 
 function resolveThreadTs(message: { thread_ts?: string; ts: string }): string {
   return message.thread_ts || message.ts;
@@ -124,8 +131,14 @@ function throttledSlackUpdater(options: {
 
   function scheduleInterval(): void {
     intervalId = setInterval(async () => {
-      const current = pendingText;
+      let current = pendingText;
       if (current === lastPosted) return;
+
+      // Truncate to 3000 chars if needed, showing the LAST 3000 chars
+      if (current.length > 3000) {
+        current = "…" + current.slice(-3000);
+      }
+
       try {
         await options.client.chat.update({
           channel: options.channel,
@@ -139,6 +152,8 @@ function throttledSlackUpdater(options: {
           clearInterval(intervalId);
           currentIntervalMs = Math.min(currentIntervalMs * 2, 10000);
           scheduleInterval();
+        } else if (err?.data?.error === "msg_too_long") {
+          // Silently skip this window
         } else {
           options.logger.warn?.(
             "chat.update failed, skipping window",
@@ -222,11 +237,11 @@ async function* queryOpenClaw(options: {
       const responseText = await response.text();
       const parsed = JSON.parse(responseText);
       const content = parsed?.choices?.[0]?.message?.content;
-      if (typeof content === "string" && content.trim()) {
+      if (typeof content === "string" && (content.trim() || content.trim().toUpperCase() === "NO_REPLY")) {
         console.warn(
           "better-openclaw-slack: gateway returned non-SSE response, falling back to non-streaming parse",
         );
-        yield content;
+        yield normalizeNoReply(content);
         return;
       }
     } catch {
@@ -633,7 +648,7 @@ export default {
             updater.stop();
 
             // Final update: replace placeholder with first chunk, post overflow as new messages.
-            const finalText = accumulated || "⚠️ Gateway returned an empty reply";
+            const finalText = normalizeNoReply(accumulated) || "⚠️ Gateway returned an empty reply";
             const chunks = splitMessage(finalText, maxMessageLength);
 
             try {
