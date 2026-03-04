@@ -2,9 +2,8 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 
 type TimerResetRef = { reset: (() => void) | null };
 type RunIdRef = { value: string | null };
+type PluginConfig = { channelId?: string; agentId?: string };
 
-const CHANNEL_ID = "C0AGCR0USR0";
-const AGENT_ID = "main";
 const MAX_MESSAGE_LENGTH = 4000;
 const UPDATE_INTERVAL_MS = 1500;
 const INACTIVITY_TIMEOUT_MS = 60000;
@@ -496,9 +495,14 @@ export default {
           return;
         }
 
-        const channelId = CHANNEL_ID;
+        const pluginConfig = ctx.config as PluginConfig;
+        const channelId = pluginConfig.channelId?.trim();
+        if (!channelId) {
+          logger.error("better-openclaw-slack: channelId is required in plugin config");
+          return;
+        }
         const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL?.trim() || "http://127.0.0.1:18789";
-        const agentId = AGENT_ID;
+        const agentId = pluginConfig.agentId?.trim() || "main";
         const maxMessageLength = MAX_MESSAGE_LENGTH;
         const updateIntervalMs = UPDATE_INTERVAL_MS;
         const inactivityTimeoutMs = INACTIVITY_TIMEOUT_MS;

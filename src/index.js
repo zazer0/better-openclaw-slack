@@ -11,24 +11,31 @@ if (missingVars.length > 0) {
   process.exit(1);
 }
 
-const CHANNEL_ID = 'C0AGCR0USR0';
-const AGENT_ID = 'main';
 const MAX_MESSAGE_LENGTH = 4000;
 const UPDATE_INTERVAL_MS = 1500;
 const INACTIVITY_TIMEOUT_MS = 60000;
 
-const config = {
-  slackBotToken: process.env.SLACK_BOT_TOKEN,
-  slackAppToken: process.env.SLACK_APP_TOKEN,
-  slackChannelId: CHANNEL_ID,
-  openclawGatewayUrl: process.env.OPENCLAW_GATEWAY_URL?.trim() || 'http://127.0.0.1:18789',
-  openclawGatewayToken: process.env.OPENCLAW_GATEWAY_TOKEN?.trim() || 'open-DA-claws-FR',
-  openclawAgentId: AGENT_ID,
-  maxSlackMessageLength: MAX_MESSAGE_LENGTH,
-  updateIntervalMs: UPDATE_INTERVAL_MS,
-  inactivityTimeoutMs: INACTIVITY_TIMEOUT_MS,
-  port: Number(process.env.PORT) || 3000,
-};
+function buildConfig(ctx) {
+  const channelId = ctx?.config?.channelId?.trim();
+  if (!channelId) {
+    console.error('better-openclaw-slack: channelId is required in plugin config');
+    return null;
+  }
+  return {
+    slackBotToken: process.env.SLACK_BOT_TOKEN,
+    slackAppToken: process.env.SLACK_APP_TOKEN,
+    slackChannelId: channelId,
+    openclawGatewayUrl: process.env.OPENCLAW_GATEWAY_URL?.trim() || 'http://127.0.0.1:18789',
+    openclawGatewayToken: process.env.OPENCLAW_GATEWAY_TOKEN?.trim() || 'open-DA-claws-FR',
+    openclawAgentId: ctx?.config?.agentId?.trim() || 'main',
+    maxSlackMessageLength: MAX_MESSAGE_LENGTH,
+    updateIntervalMs: UPDATE_INTERVAL_MS,
+    inactivityTimeoutMs: INACTIVITY_TIMEOUT_MS,
+    port: Number(process.env.PORT) || 3000,
+  };
+}
+
+const config = buildConfig(typeof ctx !== 'undefined' ? ctx : null);
 
 const app = new App({
   token: config.slackBotToken,
