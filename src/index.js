@@ -11,17 +11,33 @@ if (missingVars.length > 0) {
   process.exit(1);
 }
 
+// OC does not inject plugin config via env vars for standalone CJS plugins.
+// Config priority: env var (if set and non-empty) > schema default.
+function getEnvStr(name, fallback) {
+  const val = process.env[name];
+  return (val !== undefined && val.trim() !== '') ? val.trim() : fallback;
+}
+
+function getEnvInt(name, fallback) {
+  const val = process.env[name];
+  if (val !== undefined && val.trim() !== '') {
+    const n = Number(val.trim());
+    if (Number.isFinite(n)) return n;
+  }
+  return fallback;
+}
+
 const config = {
   slackBotToken: process.env.SLACK_BOT_TOKEN,
   slackAppToken: process.env.SLACK_APP_TOKEN,
-  slackChannelId: process.env.SLACK_CHANNEL_ID || 'C0AGCR0USR0',
-  openclawGatewayUrl: process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789',
-  openclawGatewayToken: process.env.OPENCLAW_GATEWAY_TOKEN || 'open-DA-claws-FR',
-  openclawAgentId: 'main',
-  maxSlackMessageLength: 4000,
-  updateIntervalMs: Number(process.env.UPDATE_INTERVAL_MS) || 1500,
-  inactivityTimeoutMs: Number(process.env.INACTIVITY_TIMEOUT_MS) || 60000,
-  port: Number(process.env.PORT) || 3000
+  slackChannelId: getEnvStr('SLACK_CHANNEL_ID', 'C0AGCR0USR0'),
+  openclawGatewayUrl: getEnvStr('OPENCLAW_GATEWAY_URL', 'http://127.0.0.1:18789'),
+  openclawGatewayToken: getEnvStr('OPENCLAW_GATEWAY_TOKEN', 'open-DA-claws-FR'),
+  openclawAgentId: getEnvStr('OPENCLAW_AGENT_ID', 'main'),
+  maxSlackMessageLength: getEnvInt('MAX_MESSAGE_LENGTH', 4000),
+  updateIntervalMs: getEnvInt('UPDATE_INTERVAL_MS', 1500),
+  inactivityTimeoutMs: getEnvInt('INACTIVITY_TIMEOUT_MS', 60000),
+  port: getEnvInt('PORT', 3000),
 };
 
 const app = new App({
@@ -87,7 +103,7 @@ function makeError(code, message, extra) {
   return Object.assign(new Error(message), { code, ...extra });
 }
 
-async function readWithInactivityTimeout(reader, timeoutMs, ac, provideReset) {
+async function readWithInactivityTimeout(reader, timeoutMsRef, ac, provideReset) {
   return new Promise((resolve, reject) => {
     let timer;
 
@@ -95,7 +111,7 @@ async function readWithInactivityTimeout(reader, timeoutMs, ac, provideReset) {
       timer = setTimeout(() => {
         ac.abort();
         reject(makeError('GATEWAY_TIMEOUT', '⚠️ Gateway timed out — try again'));
-      }, timeoutMs);
+      }, timeoutMsRef.ms);
     };
 
     const reset = () => {
@@ -168,7 +184,7 @@ function throttledSlackUpdater({ client, channel, placeholderTs, updateIntervalM
   };
 }
 
-async function* queryOpenClaw({ sessionKey, userText, inactivityTimeoutMs, timerResetRef, runIdRef }) {
+async function* queryOpenClaw({ sessionKey, userText, inactivityTimeoutMsRef, timerResetRef, runIdRef }) {
   const ac = new AbortController();
   const endpoint = `${config.openclawGatewayUrl.replace(/\/$/, '')}/v1/chat/completions`;
   const body = {
@@ -231,7 +247,7 @@ async function* queryOpenClaw({ sessionKey, userText, inactivityTimeoutMs, timer
     while (true) {
       const chunk = await readWithInactivityTimeout(
         reader,
-        inactivityTimeoutMs,
+        inactivityTimeoutMsRef,
         ac,
         timerResetRef
           ? (reset) => { timerResetRef.reset = reset; }
@@ -279,7 +295,7 @@ async function* queryOpenClaw({ sessionKey, userText, inactivityTimeoutMs, timer
 // Calls onToolStart when a tool.start event arrives (filtered by runId).
 // Resets the inactivity timer on every tool event.
 // Returns a cleanup handle. Rejects if the WS cannot connect/authenticate.
-async function openToolWatcher({ gatewayUrl, gatewayToken, runIdRef, timerResetRef, onToolStart, logger }) {
+async function openToolWatcher({ gatewayUrl, gatewayToken, runIdRef, timerResetRef, onConnected, onToolStart, logger }) {
   const wsUrl = gatewayUrl
     .replace(/^https:\/\//i, 'wss://')
     .replace(/^http:\/\//i, 'ws://')
@@ -360,6 +376,7 @@ async function openToolWatcher({ gatewayUrl, gatewayToken, runIdRef, timerResetR
           clearTimeout(connectTimeout);
           if (msg.ok) {
             connected = true;
+            if (onConnected) onConnected();
             resolve({ close: closeWs });
           } else {
             reject(new Error(`WS auth failed: ${msg.error?.message ?? 'unknown'}`));
@@ -470,6 +487,7 @@ app.message(async ({ message, client, logger }) => {
 
   const timerResetRef = { reset: null };
   const runIdRef = { value: null };
+  const timeoutMsRef = { ms: config.inactivityTimeoutMs };
   const toolNames = [];
   let toolWatcher = null;
 
@@ -488,6 +506,10 @@ app.message(async ({ message, client, logger }) => {
     gatewayToken: config.openclawGatewayToken,
     runIdRef,
     timerResetRef,
+    onConnected: () => {
+      // WS auth succeeded — gateway is alive. Use a long timeout for the rest of the stream.
+      timeoutMsRef.ms = 600000;
+    },
     onToolStart: (toolName) => {
       if (!toolNames.includes(toolName)) {
         toolNames.push(toolName);
@@ -507,7 +529,7 @@ app.message(async ({ message, client, logger }) => {
     for await (const delta of queryOpenClaw({
       sessionKey,
       userText: message.text,
-      inactivityTimeoutMs: config.inactivityTimeoutMs,
+      inactivityTimeoutMsRef: timeoutMsRef,
       timerResetRef,
       runIdRef
     })) {

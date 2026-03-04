@@ -108,7 +108,7 @@ function makeError(
 
 async function readWithInactivityTimeout<T>(
   reader: ReadableStreamDefaultReader<T>,
-  timeoutMs: number,
+  timeoutMsRef: { ms: number },
   ac: AbortController,
   provideReset?: (reset: () => void) => void,
 ): Promise<ReadableStreamReadResult<T>> {
@@ -119,7 +119,7 @@ async function readWithInactivityTimeout<T>(
       timer = setTimeout(() => {
         ac.abort();
         reject(makeError("GATEWAY_TIMEOUT", "⚠️ Gateway timed out — try again"));
-      }, timeoutMs);
+      }, timeoutMsRef.ms);
     };
 
     const reset = () => {
@@ -211,7 +211,7 @@ async function* queryOpenClaw(options: {
   gatewayUrl: string;
   gatewayToken: string | undefined;
   agentId: string;
-  inactivityTimeoutMs: number;
+  inactivityTimeoutMsRef: { ms: number };
   timerResetRef?: TimerResetRef;
   runIdRef?: RunIdRef;
 }): AsyncGenerator<string, void, unknown> {
@@ -282,7 +282,7 @@ async function* queryOpenClaw(options: {
     while (true) {
       const chunk = await readWithInactivityTimeout(
         reader,
-        options.inactivityTimeoutMs,
+        options.inactivityTimeoutMsRef,
         ac,
         options.timerResetRef
           ? (reset) => {
@@ -337,6 +337,7 @@ async function openToolWatcher(options: {
   gatewayToken: string | undefined;
   runIdRef: RunIdRef;
   timerResetRef: TimerResetRef;
+  onConnected?: () => void;
   onToolStart: (toolName: string) => void;
   logger: { warn?: (message: string, ...args: unknown[]) => void };
 }): Promise<{ close: () => void }> {
@@ -430,6 +431,7 @@ async function openToolWatcher(options: {
           clearTimeout(connectTimeout);
           if (msg.ok) {
             connected = true;
+            options.onConnected?.();
             resolve({ close: closeWs });
           } else {
             reject(
@@ -532,12 +534,13 @@ export default {
         }
 
         const cfg = (ctx.config ?? {}) as PluginConfig;
-        const channelId = parseChannelId(cfg.channelId);
-        const gatewayUrl = parseGatewayUrl(cfg.gatewayUrl);
-        const agentId = parseAgentId(cfg.agentId);
-        const maxMessageLength = parseMaxMessageLength(cfg.maxMessageLength);
-        const updateIntervalMs = parseUpdateIntervalMs(cfg.updateIntervalMs);
-        const inactivityTimeoutMs = parseInactivityTimeoutMs(cfg.inactivityTimeoutMs);
+        // Config priority: env var (if set and non-empty) > OC plugin config > schema default.
+        const channelId = parseChannelId(process.env.SLACK_CHANNEL_ID?.trim() || cfg.channelId);
+        const gatewayUrl = parseGatewayUrl(process.env.OPENCLAW_GATEWAY_URL?.trim() || cfg.gatewayUrl);
+        const agentId = parseAgentId(process.env.OPENCLAW_AGENT_ID?.trim() || cfg.agentId);
+        const maxMessageLength = parseMaxMessageLength(process.env.MAX_MESSAGE_LENGTH?.trim() || cfg.maxMessageLength);
+        const updateIntervalMs = parseUpdateIntervalMs(process.env.UPDATE_INTERVAL_MS?.trim() || cfg.updateIntervalMs);
+        const inactivityTimeoutMs = parseInactivityTimeoutMs(process.env.INACTIVITY_TIMEOUT_MS?.trim() || cfg.inactivityTimeoutMs);
 
         let SlackApp;
         let LogLevel;
@@ -609,6 +612,7 @@ export default {
 
           const timerResetRef: TimerResetRef = { reset: null };
           const runIdRef: RunIdRef = { value: null };
+          const timeoutMsRef: { ms: number } = { ms: inactivityTimeoutMs };
           const toolNames: string[] = [];
           let toolWatcher: { close: () => void } | null = null;
 
@@ -627,6 +631,10 @@ export default {
             gatewayToken,
             runIdRef,
             timerResetRef,
+            onConnected: () => {
+              // WS auth succeeded — gateway is alive. Use a long timeout for the rest of the stream.
+              timeoutMsRef.ms = 600000;
+            },
             onToolStart: (toolName) => {
               if (!toolNames.includes(toolName)) {
                 toolNames.push(toolName);
@@ -649,7 +657,7 @@ export default {
               gatewayUrl,
               gatewayToken,
               agentId,
-              inactivityTimeoutMs,
+              inactivityTimeoutMsRef: timeoutMsRef,
               timerResetRef,
               runIdRef,
             })) {
