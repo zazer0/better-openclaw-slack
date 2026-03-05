@@ -134,6 +134,7 @@ function throttledSlackUpdater({ client, channel, placeholderTs, updateIntervalM
   let pendingText = '';
   let lastPosted = '';
   let contentReceived = false;
+  let updateSucceeded = false;
   let currentIntervalMs = updateIntervalMs;
   let intervalId;
 
@@ -154,6 +155,9 @@ function throttledSlackUpdater({ client, channel, placeholderTs, updateIntervalM
           text: current
         });
         lastPosted = current;
+        if (contentReceived) {
+          updateSucceeded = true;
+        }
       } catch (err) {
         if (err?.data?.error === 'ratelimited' || err?.code === 'slack_webapi_rate_limited_error') {
           logger.warn('chat.update rate limited, backing off');
@@ -183,6 +187,9 @@ function throttledSlackUpdater({ client, channel, placeholderTs, updateIntervalM
     },
     stop() {
       clearInterval(intervalId);
+    },
+    hasPosted() {
+      return updateSucceeded;
     }
   };
 }
@@ -594,13 +601,11 @@ module.exports = {
             }
 
             try {
-              // For GATEWAY_TIMEOUT and GATEWAY_STREAM_ERROR with accumulated content:
-              // the placeholder already shows the accumulated text, so post the error
-              // as a follow-up message instead of overwriting it.
               const hasAccumulated = accumulated.length > 0;
+              const isMidStreamError =
+                code === 'GATEWAY_TIMEOUT' || code === 'GATEWAY_STREAM_ERROR';
               const preservePlaceholder =
-                hasAccumulated &&
-                (code === 'GATEWAY_TIMEOUT' || code === 'GATEWAY_STREAM_ERROR');
+                hasAccumulated && isMidStreamError && updater.hasPosted();
 
               if (preservePlaceholder) {
                 await client.chat.postMessage({
@@ -608,6 +613,21 @@ module.exports = {
                   thread_ts: threadTs,
                   text: errorText
                 });
+              } else if (hasAccumulated && isMidStreamError) {
+                const combined = `${accumulated}\n\n${errorText}`;
+                const combinedChunks = splitMessage(combined, config.maxSlackMessageLength);
+                await client.chat.update({
+                  channel: message.channel,
+                  ts: placeholderTs,
+                  text: combinedChunks[0]
+                });
+                for (let i = 1; i < combinedChunks.length; i++) {
+                  await client.chat.postMessage({
+                    channel: message.channel,
+                    thread_ts: threadTs,
+                    text: combinedChunks[i]
+                  });
+                }
               } else {
                 const errorChunks = splitMessage(errorText, config.maxSlackMessageLength);
                 await client.chat.update({

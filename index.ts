@@ -122,10 +122,12 @@ function throttledSlackUpdater(options: {
   onDelta: (accumulated: string) => void;
   setWorkingText: (text: string) => void;
   stop: () => void;
+  hasPosted: () => boolean;
 } {
   let pendingText = "";
   let lastPosted = "";
   let contentReceived = false;
+  let updateSucceeded = false;
   let currentIntervalMs = options.updateIntervalMs;
   let intervalId: ReturnType<typeof setInterval>;
 
@@ -146,6 +148,9 @@ function throttledSlackUpdater(options: {
           text: current,
         });
         lastPosted = current;
+        if (contentReceived) {
+          updateSucceeded = true;
+        }
       } catch (err: any) {
         if (err?.data?.error === "ratelimited" || err?.code === "slack_webapi_rate_limited_error") {
           options.logger.warn?.("chat.update rate limited, backing off");
@@ -178,6 +183,9 @@ function throttledSlackUpdater(options: {
     },
     stop(): void {
       clearInterval(intervalId);
+    },
+    hasPosted(): boolean {
+      return updateSucceeded;
     },
   };
 }
@@ -713,13 +721,11 @@ export default {
             }
 
             try {
-              // For GATEWAY_TIMEOUT and GATEWAY_STREAM_ERROR with accumulated content:
-              // the placeholder already shows the accumulated text, so post the error
-              // as a follow-up message instead of overwriting it.
               const hasAccumulated = accumulated.length > 0;
+              const isMidStreamError =
+                code === "GATEWAY_TIMEOUT" || code === "GATEWAY_STREAM_ERROR";
               const preservePlaceholder =
-                hasAccumulated &&
-                (code === "GATEWAY_TIMEOUT" || code === "GATEWAY_STREAM_ERROR");
+                hasAccumulated && isMidStreamError && updater.hasPosted();
 
               if (preservePlaceholder) {
                 await client.chat.postMessage({
@@ -727,6 +733,21 @@ export default {
                   thread_ts: threadTs,
                   text: errorText,
                 });
+              } else if (hasAccumulated && isMidStreamError) {
+                const combined = `${accumulated}\n\n${errorText}`;
+                const combinedChunks = splitMessage(combined, maxMessageLength);
+                await client.chat.update({
+                  channel: message.channel,
+                  ts: placeholderTs,
+                  text: combinedChunks[0],
+                });
+                for (let i = 1; i < combinedChunks.length; i++) {
+                  await client.chat.postMessage({
+                    channel: message.channel,
+                    thread_ts: threadTs,
+                    text: combinedChunks[i],
+                  });
+                }
               } else {
                 const errorChunks = splitMessage(errorText, maxMessageLength);
                 await client.chat.update({
