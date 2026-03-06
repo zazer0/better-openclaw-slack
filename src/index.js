@@ -569,17 +569,61 @@ module.exports = {
                     text: chunks[0]
                   });
                 }
+              } else if (err?.data?.error === 'msg_too_long') {
+                // Chunk rejected — split further and retry
+                const smallerChunks = splitMessage(chunks[0], Math.floor(config.maxSlackMessageLength / 2));
+                try {
+                  await client.chat.update({
+                    channel: message.channel,
+                    ts: placeholderTs,
+                    text: smallerChunks[0]
+                  });
+                  for (let i = 1; i < smallerChunks.length; i++) {
+                    await client.chat.postMessage({
+                      channel: message.channel,
+                      thread_ts: threadTs,
+                      text: smallerChunks[i]
+                    });
+                  }
+                  // Prepend remaining original chunks
+                  chunks.splice(0, 1, ...smallerChunks);
+                } catch {
+                  // If still fails, fall back to postMessage
+                  for (const chunk of smallerChunks) {
+                    await client.chat.postMessage({
+                      channel: message.channel,
+                      thread_ts: threadTs,
+                      text: chunk
+                    });
+                  }
+                  chunks.shift();
+                }
               } else {
                 throw err;
               }
             }
 
             for (let i = 1; i < chunks.length; i++) {
-              await client.chat.postMessage({
-                channel: message.channel,
-                thread_ts: threadTs,
-                text: chunks[i]
-              });
+              try {
+                await client.chat.postMessage({
+                  channel: message.channel,
+                  thread_ts: threadTs,
+                  text: chunks[i]
+                });
+              } catch (err) {
+                if (err?.data?.error === 'msg_too_long') {
+                  const smallerChunks = splitMessage(chunks[i], Math.floor(config.maxSlackMessageLength / 2));
+                  for (const chunk of smallerChunks) {
+                    await client.chat.postMessage({
+                      channel: message.channel,
+                      thread_ts: threadTs,
+                      text: chunk
+                    });
+                  }
+                } else {
+                  throw err;
+                }
+              }
             }
           } catch (error) {
             updater.stop();
@@ -615,39 +659,114 @@ module.exports = {
                 hasAccumulated && isMidStreamError && updater.hasPosted();
 
               if (preservePlaceholder) {
-                await client.chat.postMessage({
-                  channel: message.channel,
-                  thread_ts: threadTs,
-                  text: errorText
-                });
+                const errorChunks = splitMessage(errorText, config.maxSlackMessageLength);
+                for (const chunk of errorChunks) {
+                  await client.chat.postMessage({
+                    channel: message.channel,
+                    thread_ts: threadTs,
+                    text: chunk
+                  });
+                }
               } else if (hasAccumulated && isMidStreamError) {
                 const combined = `${accumulated}\n\n${errorText}`;
                 const combinedChunks = splitMessage(combined, config.maxSlackMessageLength);
-                await client.chat.update({
-                  channel: message.channel,
-                  ts: placeholderTs,
-                  text: combinedChunks[0]
-                });
-                for (let i = 1; i < combinedChunks.length; i++) {
-                  await client.chat.postMessage({
+                try {
+                  await client.chat.update({
                     channel: message.channel,
-                    thread_ts: threadTs,
-                    text: combinedChunks[i]
+                    ts: placeholderTs,
+                    text: combinedChunks[0]
                   });
+                } catch (err) {
+                  if (err?.data?.error === 'msg_too_long') {
+                    const smallerChunks = splitMessage(combinedChunks[0], Math.floor(config.maxSlackMessageLength / 2));
+                    await client.chat.update({
+                      channel: message.channel,
+                      ts: placeholderTs,
+                      text: smallerChunks[0]
+                    });
+                    for (let i = 1; i < smallerChunks.length; i++) {
+                      await client.chat.postMessage({
+                        channel: message.channel,
+                        thread_ts: threadTs,
+                        text: smallerChunks[i]
+                      });
+                    }
+                    combinedChunks.splice(0, 1, ...smallerChunks);
+                  } else {
+                    throw err;
+                  }
+                }
+                for (let i = 1; i < combinedChunks.length; i++) {
+                  try {
+                    await client.chat.postMessage({
+                      channel: message.channel,
+                      thread_ts: threadTs,
+                      text: combinedChunks[i]
+                    });
+                  } catch (err) {
+                    if (err?.data?.error === 'msg_too_long') {
+                      const smallerChunks = splitMessage(combinedChunks[i], Math.floor(config.maxSlackMessageLength / 2));
+                      for (const chunk of smallerChunks) {
+                        await client.chat.postMessage({
+                          channel: message.channel,
+                          thread_ts: threadTs,
+                          text: chunk
+                        });
+                      }
+                    } else {
+                      throw err;
+                    }
+                  }
                 }
               } else {
                 const errorChunks = splitMessage(errorText, config.maxSlackMessageLength);
-                await client.chat.update({
-                  channel: message.channel,
-                  ts: placeholderTs,
-                  text: errorChunks[0]
-                });
-                for (let i = 1; i < errorChunks.length; i++) {
-                  await client.chat.postMessage({
+                try {
+                  await client.chat.update({
                     channel: message.channel,
-                    thread_ts: threadTs,
-                    text: errorChunks[i]
+                    ts: placeholderTs,
+                    text: errorChunks[0]
                   });
+                } catch (err) {
+                  if (err?.data?.error === 'msg_too_long') {
+                    const smallerChunks = splitMessage(errorChunks[0], Math.floor(config.maxSlackMessageLength / 2));
+                    await client.chat.update({
+                      channel: message.channel,
+                      ts: placeholderTs,
+                      text: smallerChunks[0]
+                    });
+                    for (let i = 1; i < smallerChunks.length; i++) {
+                      await client.chat.postMessage({
+                        channel: message.channel,
+                        thread_ts: threadTs,
+                        text: smallerChunks[i]
+                      });
+                    }
+                    errorChunks.splice(0, 1, ...smallerChunks);
+                  } else {
+                    throw err;
+                  }
+                }
+                for (let i = 1; i < errorChunks.length; i++) {
+                  try {
+                    await client.chat.postMessage({
+                      channel: message.channel,
+                      thread_ts: threadTs,
+                      text: errorChunks[i]
+                    });
+                  } catch (err) {
+                    if (err?.data?.error === 'msg_too_long') {
+                      const smallerChunks = splitMessage(errorChunks[i], Math.floor(config.maxSlackMessageLength / 2));
+                      for (const chunk of smallerChunks) {
+                        await client.chat.postMessage({
+                          channel: message.channel,
+                          thread_ts: threadTs,
+                          text: chunk
+                        });
+                      }
+                    } else {
+                      throw err;
+                    }
+                  }
                 }
               }
             } catch (postError) {
