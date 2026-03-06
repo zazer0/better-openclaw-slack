@@ -303,6 +303,13 @@ async function* queryOpenClaw(options: {
             hasContent = true;
             yield delta;
           }
+
+          // Extend timeout when tool calls detected — silent tool-execution period follows
+          const toolCallsDelta = parsed?.choices?.[0]?.delta?.tool_calls;
+          if (toolCallsDelta) {
+            options.inactivityTimeoutMsRef.ms = Math.max(options.inactivityTimeoutMsRef.ms, 600000);
+            options.timerResetRef?.reset?.();
+          }
         } catch {
           // Skip malformed SSE data lines.
         }

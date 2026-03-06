@@ -299,6 +299,13 @@ module.exports = {
                     hasContent = true;
                     yield delta;
                   }
+
+                  // Extend timeout when tool calls detected — silent tool-execution period follows
+                  const toolCallsDelta = parsed?.choices?.[0]?.delta?.tool_calls;
+                  if (toolCallsDelta) {
+                    inactivityTimeoutMsRef.ms = Math.max(inactivityTimeoutMsRef.ms, 600000);
+                    if (timerResetRef?.reset) timerResetRef.reset();
+                  }
                 } catch {
                   // Skip malformed SSE data lines.
                 }
