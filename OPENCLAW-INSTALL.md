@@ -178,14 +178,11 @@ If you already have the plugin installed and want to pull the latest version:
 # 1. Pull latest from GitHub
 cd ~/.openclaw/extensions/better-openclaw-slack && git pull origin main
 
-# 2. Copy the runnable JS into place (required — OC loads index.js, not src/index.js)
-cp src/index.js index.js
-
-# 3. Restart the gateway
+# 2. Restart the gateway
 systemctl --user restart openclaw-gateway || openclaw gateway restart
 ```
 
-**Why step 2?** The repo's canonical source is `index.ts` (TypeScript) with a CJS mirror at `src/index.js`. OC loads `index.js` from the top-level directory. There is no build step — deploying means copying `src/index.js` to `index.js`. If you skip this, the old version keeps running even after a pull.
+`index.js` at the repository root is the single deployable file. There is no build or copy step.
 
 
 ### ⚠️ New instance? Disable the native Slack channel
