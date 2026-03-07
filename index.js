@@ -196,6 +196,7 @@ function throttledSlackUpdater({ client, channel, placeholderTs, updateIntervalM
 module.exports = {
   register(api) {
     api.registerService({
+      id: 'better-openclaw-slack',
       name: 'better-openclaw-slack',
       start: async (ctx) => {
         const config = buildConfig(api);
