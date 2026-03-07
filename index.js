@@ -1,6 +1,5 @@
 'use strict';
 
-require('dotenv').config();
 const { App, LogLevel } = require('@slack/bolt');
 const WebSocket = require('ws');
 
