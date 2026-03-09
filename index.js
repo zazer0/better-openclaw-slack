@@ -36,7 +36,7 @@ function buildConfig(api) {
     openclawAgentId: api?.pluginConfig?.agentId?.trim() || 'main',
     maxSlackMessageLength: MAX_MESSAGE_LENGTH,
     updateIntervalMs: UPDATE_INTERVAL_MS,
-    inactivityTimeoutMs: INACTIVITY_TIMEOUT_MS,
+    inactivityTimeoutMs: api?.pluginConfig?.inactivityTimeoutMs || INACTIVITY_TIMEOUT_MS,
     port: Number(process.env.PORT) || 3000,
   };
 }

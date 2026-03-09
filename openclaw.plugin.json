@@ -38,8 +38,8 @@
       "inactivityTimeoutMs": {
         "type": "integer",
         "minimum": 5000,
-        "maximum": 300000,
-        "default": 60000,
+        "maximum": 3600000,
+        "default": 600000,
         "description": "Abort stream after this many ms of silence from the gateway"
       }
     }
