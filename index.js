@@ -12,13 +12,27 @@ if (missingVars.length > 0) {
 
 const MAX_MESSAGE_LENGTH = 3000;
 const UPDATE_INTERVAL_MS = 1500;
-const INACTIVITY_TIMEOUT_MS = 300000;
+const INACTIVITY_TIMEOUT_MS = 600000;
 
 function normalizeNoReply(text) {
   if (text.trim().toUpperCase() === 'NO_REPLY') {
     return '🤫 [Model chose NO_REPLY]';
   }
   return text;
+}
+
+function resolveInactivityTimeoutMs(pluginConfig) {
+  const configured = pluginConfig?.inactivityTimeoutMs;
+  if (typeof configured !== 'number' || !Number.isFinite(configured)) {
+    return INACTIVITY_TIMEOUT_MS;
+  }
+
+  const normalized = Math.trunc(configured);
+  if (normalized < 5000 || normalized > 3600000) {
+    return INACTIVITY_TIMEOUT_MS;
+  }
+
+  return normalized;
 }
 
 function buildConfig(api) {
@@ -36,7 +50,7 @@ function buildConfig(api) {
     openclawAgentId: api?.pluginConfig?.agentId?.trim() || 'main',
     maxSlackMessageLength: MAX_MESSAGE_LENGTH,
     updateIntervalMs: UPDATE_INTERVAL_MS,
-    inactivityTimeoutMs: api?.pluginConfig?.inactivityTimeoutMs || INACTIVITY_TIMEOUT_MS,
+    inactivityTimeoutMs: resolveInactivityTimeoutMs(api?.pluginConfig),
     port: Number(process.env.PORT) || 3000,
   };
 }
