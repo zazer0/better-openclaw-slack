@@ -16,9 +16,71 @@ const INACTIVITY_TIMEOUT_MS = 600000;
 
 function normalizeNoReply(text) {
   if (text.trim().toUpperCase() === 'NO_REPLY') {
-    return '🤫 [Model chose NO_REPLY]';
+    return '';
   }
   return text;
+}
+
+function extractTextParts(content) {
+  if (typeof content === 'string') {
+    return content;
+  }
+
+  if (!Array.isArray(content)) {
+    return '';
+  }
+
+  return content
+    .map((part) => {
+      if (typeof part === 'string') {
+        return part;
+      }
+      if (typeof part?.text === 'string') {
+        return part.text;
+      }
+      if (typeof part?.content === 'string') {
+        return part.content;
+      }
+      return '';
+    })
+    .join('');
+}
+
+function extractChoiceText(choice) {
+  return extractTextParts(choice?.delta?.content) || extractTextParts(choice?.message?.content);
+}
+
+function hasIntentionalNoReply(choice) {
+  if (!choice || typeof choice !== 'object') {
+    return false;
+  }
+
+  const finishReason = typeof choice.finish_reason === 'string' ? choice.finish_reason.trim() : '';
+  if (finishReason && finishReason !== 'stop') {
+    return true;
+  }
+
+  const message = choice.message;
+  if (message && typeof message === 'object') {
+    if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+      return true;
+    }
+    if (Array.isArray(message.content) && message.content.some((part) => typeof part?.type === 'string' && part.type !== 'text')) {
+      return true;
+    }
+  }
+
+  const delta = choice.delta;
+  if (delta && typeof delta === 'object') {
+    if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) {
+      return true;
+    }
+    if (Array.isArray(delta.content) && delta.content.some((part) => typeof part?.type === 'string' && part.type !== 'text')) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 function resolveInactivityTimeoutMs(pluginConfig) {
@@ -259,10 +321,11 @@ module.exports = {
             try {
               const responseText = await response.text();
               const parsed = JSON.parse(responseText);
-              const content = parsed?.choices?.[0]?.message?.content;
-              if (typeof content === 'string' && (content.trim() || content.trim().toUpperCase() === 'NO_REPLY')) {
+              const choice = parsed?.choices?.[0];
+              const content = extractChoiceText(choice);
+              if (content.trim() || content.trim().toUpperCase() === 'NO_REPLY' || hasIntentionalNoReply(choice)) {
                 logger.warn('better-openclaw-slack: gateway returned non-SSE response, falling back to non-streaming parse');
-                yield normalizeNoReply(content);
+                yield normalizeNoReply(content || 'NO_REPLY');
                 return;
               }
             } catch {
@@ -274,6 +337,7 @@ module.exports = {
           const reader = response.body.getReader();
           const decoder = new TextDecoder();
           let hasContent = false;
+          let hasStructuredCompletion = false;
           let lineBuffer = '';
 
           try {
@@ -289,6 +353,10 @@ module.exports = {
 
               if (chunk.done) {
                 if (hasContent) return;
+                if (hasStructuredCompletion) {
+                  yield '';
+                  return;
+                }
                 throw makeError('GATEWAY_EMPTY_STREAM', '⚠️ Gateway returned an empty reply');
               }
 
@@ -300,7 +368,12 @@ module.exports = {
                 const trimmed = line.trim();
                 if (!trimmed.startsWith('data:')) continue;
                 const dataStr = trimmed.slice('data:'.length).trim();
-                if (dataStr === '[DONE]') return;
+                if (dataStr === '[DONE]') {
+                  if (!hasContent && hasStructuredCompletion) {
+                    yield '';
+                  }
+                  return;
+                }
                 try {
                   const parsed = JSON.parse(dataStr);
 
@@ -308,15 +381,21 @@ module.exports = {
                     runIdRef.value = String(parsed.id);
                   }
 
-                  const delta = parsed?.choices?.[0]?.delta?.content;
-                  if (typeof delta === 'string' && delta.length > 0) {
+                  const choice = parsed?.choices?.[0];
+                  const delta = extractChoiceText(choice);
+                  if (delta.length > 0) {
                     hasContent = true;
                     yield delta;
                   }
 
+                  if (hasIntentionalNoReply(choice)) {
+                    hasStructuredCompletion = true;
+                  }
+
                   // Extend timeout when tool calls detected — silent tool-execution period follows
-                  const toolCallsDelta = parsed?.choices?.[0]?.delta?.tool_calls;
+                  const toolCallsDelta = choice?.delta?.tool_calls;
                   if (toolCallsDelta) {
+                    hasStructuredCompletion = true;
                     inactivityTimeoutMsRef.ms = Math.max(inactivityTimeoutMsRef.ms, 600000);
                     if (timerResetRef?.reset) timerResetRef.reset();
                   }
@@ -517,6 +596,7 @@ module.exports = {
           let toolWatcher = null;
 
           let accumulated = '';
+          let receivedReplySignal = false;
           const updater = throttledSlackUpdater({
             client,
             channel: message.channel,
@@ -551,14 +631,28 @@ module.exports = {
               timerResetRef,
               runIdRef
             })) {
+              receivedReplySignal = true;
               accumulated += delta;
               updater.onDelta(accumulated);
             }
 
             updater.stop();
 
-            const finalText = normalizeNoReply(accumulated) || '⚠️ Gateway returned an empty reply';
-            const chunks = splitMessage(finalText, config.maxSlackMessageLength);
+            const finalText = normalizeNoReply(accumulated);
+            if (!finalText && receivedReplySignal) {
+              try {
+                await client.chat.delete({
+                  channel: message.channel,
+                  ts: placeholderTs
+                });
+              } catch (err) {
+                logger.warn('Failed to delete placeholder after NO_REPLY completion', err);
+              }
+              return;
+            }
+
+            const resolvedFinalText = finalText || '⚠️ Gateway returned an empty reply';
+            const chunks = splitMessage(resolvedFinalText, config.maxSlackMessageLength);
 
             try {
               await client.chat.update({
@@ -799,7 +893,11 @@ module.exports = {
             return;
           }
 
-          if (message.bot_id || message.subtype === 'bot_message') {
+          if (message.bot_id) {
+            return;
+          }
+
+          if (message.subtype) {
             return;
           }
 
